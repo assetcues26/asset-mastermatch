@@ -32,7 +32,7 @@ pip install -r requirements-dev.txt
 func start
 ```
 
-4. Call the endpoint with a sample from `samples/sample_payloads.json`.
+4. `POST` to `http://localhost:7071/api/asset_master_match` with a JSON body from the **Request shape** examples below (e.g. Postman).
 
 ## Lint and tests
 
@@ -54,7 +54,7 @@ Config lives in `pyproject.toml` (`[tool.ruff]`, `[tool.pytest.ini_options]`).
 
 ## Request shape
 
-**Preferred (Option A)** — one or more customers; each group has its own `CustomerId` (Pinecone never mixes customers):
+**Preferred (Option A)** — nested `requests[]`; one or more customers; each group has its own `CustomerId` (Pinecone never mixes customers):
 
 ```json
 {
@@ -62,13 +62,37 @@ Config lives in `pyproject.toml` (`[tool.ruff]`, `[tool.pytest.ini_options]`).
     {
       "CustomerId": 1001,
       "assets": [
-        { "AssetName": "Hp Probook 430 Gb", "CategoryId": 1036, "AssetClassId": 1066 }
+        {
+          "AssetName": "Hp Probook 430 Gb",
+          "CategoryId": 1036,
+          "AssetClassId": 1066
+        }
       ]
     },
     {
-      "CustomerId": 1004,
+      "CustomerId": 1299,
       "assets": [
-        { "AssetName": "hdd 16 gb ram", "CategoryId": 1039, "AssetClassId": 1107 }
+        {
+          "AcquisitionDate": "2024-01-15",
+          "AssetNumber": "",
+          "SubNumber": 0,
+          "AssetName": "Metal Almirah",
+          "AssetType": "PP&E",
+          "PlantLocation": "Vedanta Aluminium - Admin Block",
+          "Cost": 14000,
+          "Count": 2
+        },
+        {
+          "AcquisitionDate": "2024-03-01",
+          "AssetNumber": "",
+          "SubNumber": 0,
+          "AssetName": "Voltas cassette AC 2.0 ton inverter",
+          "AssetDescription": "2.0 ton inverter cassette AC for office block",
+          "AssetType": "PP&E",
+          "PlantLocation": "Vedanta Aluminium - Office Block A",
+          "Cost": 75000,
+          "Count": 2
+        }
       ]
     }
   ]
@@ -92,34 +116,75 @@ Config lives in `pyproject.toml` (`[tool.ruff]`, `[tool.pytest.ini_options]`).
 }
 ```
 
+### Field rules
+
 - Prefer `requests[]`: each group’s `CustomerId` is required and used only for that group’s assets.
 - `AssetName` (required per asset) is the primary match signal (max **800** chars by default).
-- `AssetDescription` (optional) is appended to the embed query and passed to Gemini select when present (truncated; max **800** chars). Final embed query is capped at **1000** chars (name preserved).
+- `AssetDescription` (optional) is appended to the embed query and passed to Gemini select when present. Overlong description is **truncated** (not a hard error); max **800** chars. Final embed query is capped at **1000** chars (`AssetName` preserved).
 - `CategoryId` / `AssetClassId` are optional Pinecone filters (numeric ids only).
 - Every asset must be a JSON **object** (non-objects → HTTP 400).
-- All other input fields are echoed back unchanged.
 - Max **50** assets **total** across all customers; up to **10** processed in parallel (configurable).
+
+### Echoed input fields
+
+Known keys are copied onto each result row when present:
+
+`AcquisitionDate`, `AssetNumber`, `SubNumber`, `AssetName`, `AssetDescription`, `AssetType`, `PlantLocation`, `AssetClass`, `AssetClassId`, `Category`, `CategoryId`, `Cost`, `Count`
+
+Any other caller fields on the asset object are also echoed (except duplicating top-level `CustomerId` from the group). `CustomerId` on each result comes from the request group / legacy body.
 
 ## Response shape
 
-Flat `results` in input order. Each row echoes its own `CustomerId` (no top-level `CustomerId`).
+### Success (HTTP 200)
+
+Flat `results` in input order. Each row echoes its own `CustomerId` (no top-level `CustomerId`). Nested `master` holds the chosen taxonomy + MakeModel.
 
 ```json
 {
   "results": [
     {
-      "CustomerId": 1004,
-      "AssetName": "hdd 16 gb ram",
-      "CategoryId": 1039,
-      "AssetClassId": 1107,
+      "CustomerId": 1299,
+      "AcquisitionDate": "2024-01-15",
+      "AssetNumber": "",
+      "SubNumber": 0,
+      "AssetName": "Metal Almirah",
+      "AssetType": "PP&E",
+      "PlantLocation": "Vedanta Aluminium - Admin Block",
+      "Cost": 14000,
+      "Count": 2,
       "master": {
-        "AssetClass": "...",
-        "AssetClassId": 1107,
-        "Category": "Machinery",
-        "CategoryId": 1039,
-        "SubCategory": "...",
-        "SubCategoryId": 10067,
-        "MakeModel": "16 gb ram",
+        "AssetClass": "Furniture And Fittings",
+        "AssetClassId": 5673,
+        "Category": "Furniture And Fittings",
+        "CategoryId": 2958,
+        "SubCategory": "Almirah",
+        "SubCategoryId": 83195,
+        "MakeModel": "Metal Almirah",
+        "MakeModelId": 153356
+      },
+      "MatchFound": "Y",
+      "MakeModelGenerated": "N",
+      "Message": null
+    },
+    {
+      "CustomerId": 1299,
+      "AcquisitionDate": "2024-03-01",
+      "AssetNumber": "",
+      "SubNumber": 0,
+      "AssetName": "Voltas cassette AC 2.0 ton inverter",
+      "AssetDescription": "2.0 ton inverter cassette AC for office block",
+      "AssetType": "PP&E",
+      "PlantLocation": "Vedanta Aluminium - Office Block A",
+      "Cost": 75000,
+      "Count": 2,
+      "master": {
+        "AssetClass": "Office Equipment",
+        "AssetClassId": 5669,
+        "Category": "Office Equipment",
+        "CategoryId": 2744,
+        "SubCategory": "Cassette AC",
+        "SubCategoryId": 83160,
+        "MakeModel": "Voltas 2.0 Ton Inverter Cassette AC",
         "MakeModelId": null
       },
       "MatchFound": "Y",
@@ -155,7 +220,17 @@ Flat `results` in input order. Each row echoes its own `CustomerId` (no top-leve
 
 Exception detail stays in server logs / `func` stderr only (never echoed into `Message`).
 
-Per-item failures set `Error: true` and a `Message`; other assets in the batch still return.
+Per-item failures set `Error: true` and a `Message`; other assets in the batch still return (HTTP 200 with mixed rows).
+
+### Batch validation errors (HTTP 400)
+
+Malformed body / request shape failures return before matching:
+
+```json
+{ "error": "CustomerId is required (or send requests[])" }
+```
+
+Other examples: `requests must be a non-empty array`, `requests[0].assets must be a non-empty array`, `assets[0] must be an object`, `At most 50 assets allowed per request`, `Request body must be JSON`.
 
 ## Settings (important)
 
@@ -164,21 +239,20 @@ See `local.settings.json.example`. Never commit `local.settings.json`.
 | Key | Role |
 |-----|------|
 | `GEMINI_API_KEY` / `GEMINI_MODEL_NAME` | LLM (swap 3.1 ↔ 2.5 Flash Lite here) |
+| `GEMINI_CALL_TIMEOUT_SEC` / `GEMINI_MAX_RETRIES` | Per-call timeout (default `30`) / retries (default `3`) |
+| `GEMINI_MAX_INPUT_TOKENS` / `GEMINI_MAX_OUTPUT_TOKENS` / `GEMINI_DEFAULT_OUTPUT_TOKENS` | Prompt / generation token caps |
+| `GEMINI_MAX_CALLS_PER_MINUTE` / `_HOUR` / `_DAY` | Local select caps (defaults `120` / `500` / `5000`) |
+| `GEMINI_MAX_PROMPT_CHARS` | Optional override of prompt char budget (else ~4× input tokens) |
 | `EMBEDDING_MODEL_NAME` / `EMBEDDING_DIMENSION` | Embeddings (`1536`) |
 | `PINECONE_API_KEY` / `PINECONE_INDEX_NAME` | Vector index |
 | `PINECONE_TOP_K` | Default `5` |
+| `PINECONE_MAX_CALLS_PER_MINUTE` / `_HOUR` / `_DAY` | Local query caps (defaults `100` / `1000` / `10000`) |
 | `MAX_ASSETS_PER_REQUEST` / `MAX_PARALLEL_ITEMS` | Batch size (50) / parallel workers (10) |
-| `GEMINI_MAX_CALLS_PER_MINUTE` | Local select cap (default `120`; hour/day still 500 / 5000) |
-| `PINECONE_MAX_CALLS_PER_MINUTE` | Local query cap (default `100`; hour/day still 1000 / 10000) |
 | `MAX_ASSET_NAME_LENGTH` / `MAX_ASSET_DESCRIPTION_LENGTH` | Input name / optional description caps |
 | `MAX_EMBED_QUERY_LENGTH` | Cap on name(+description) text sent to embed (default `1000`) |
-| `MAX_MAKE_MODEL_LENGTH` | Generated MakeModel cap |
-| `GEMINI_MAX_INPUT_TOKENS` / `GEMINI_MAX_PROMPT_CHARS` | Prompt size guard before Gemini |
-| Timeouts / retries / call caps | Cost and hang protection |
-
-## Samples for the team
-
-Shareable dummy requests: [`samples/sample_payloads.json`](samples/sample_payloads.json)
+| `MAX_MAKE_MODEL_LENGTH` | Generated MakeModel cap (default `150`) |
+| `MAX_PROMPT_FIELD_LENGTH` | Per-field truncate in prompts (default `200`) |
+| `PROMPT_HOT_RELOAD` | Reload prompt markdown without restart (`false` by default) |
 
 ## Open questions for senior (throughput / production)
 
