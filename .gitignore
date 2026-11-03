@@ -1,0 +1,53 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env
+.env.*
+!.env.example
+
+# Secrets — never commit real keys
+local.settings.json
+credentials.json
+secrets.json
+**/secrets/
+*.pem
+*.key
+
+# Azure Functions / Azurite
+bin/
+obj/
+appsettings.json
+.python_packages/
+__blobstorage__/
+__queuestorage__/
+__azurite_db*__.json
+
+# Tests / tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Local agent notes (not for remote / deploy)
+cursor.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+*.log
+Thumbs.db
+.coverage.*
