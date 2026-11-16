@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import json
+import time
 
 from asset_master_match.core.config import MAX_ASSET_NAME_LENGTH
-from asset_master_match.services.match_service import match_one_asset, run_asset_master_match
+from asset_master_match.services import match_service
+from asset_master_match.services.match_service import (
+    MSG_TIMED_OUT,
+    match_one_asset,
+    run_asset_master_match,
+)
 
 
 def _body(resp) -> dict:
@@ -116,23 +122,24 @@ def test_match_one_asset_name_too_long():
     assert "maximum length" in result["Message"]
 
 
-def test_match_one_no_pinecone_hits(mock_embedding, mock_pinecone, sample_candidate):
+def test_match_one_no_pinecone_hits(mock_embedding, mock_pinecone, mock_llm):
     mock_embedding()
     mock_pinecone([])
+    mock_llm({"make_model": "Unknown device"})
     result = match_one_asset(
         {"AssetName": "unknown device"},
         customer_id=1004,
         request_id="t2",
     )
     assert result["MatchFound"] == "N"
-    assert result["master"] is None
-    assert result["MakeModelGenerated"] == "N"
+    assert result["MakeModelGenerated"] == "Y"
+    assert result["master"]["MakeModel"] == "Unknown device"
+    assert result["master"]["MakeModelId"] is None
+    assert result["master"]["AssetClassId"] is None
     assert "No master data" in result["Message"]
 
 
-def test_match_one_success_no_llm_reason(
-    mock_embedding, mock_pinecone, mock_llm, sample_candidate
-):
+def test_match_one_success_no_llm_reason(mock_embedding, mock_pinecone, mock_llm, sample_candidate):
     mock_embedding()
     mock_pinecone([sample_candidate])
     mock_llm(
@@ -154,11 +161,11 @@ def test_match_one_success_no_llm_reason(
         request_id="t3",
     )
     assert result["MatchFound"] == "Y"
-    assert result["MakeModelGenerated"] == "Y"
+    assert result["MakeModelGenerated"] == "N"
     assert result["CustomerId"] == 1004
     assert result["Cost"] == 50000
-    assert result["master"]["MakeModel"] == "16 gb ram"
-    assert result["master"]["MakeModelId"] is None
+    assert result["master"]["MakeModel"] == "8 gb ram"
+    assert result["master"]["MakeModelId"] == 10338
     assert result["master"]["CategoryId"] == 1039
     assert result["Message"] is None
 
@@ -195,8 +202,44 @@ def test_match_one_embeds_name_plus_description(
     )
     assert result["MatchFound"] == "Y"
     assert result["AssetDescription"] == "DDR4 module for rack server"
-    assert len(seen) == 1
-    assert seen[0] == "hdd 16 gb ram\nDDR4 module for rack server"
+    # A strong name hit does not also embed the description.
+    assert seen == ["hdd 16 gb ram"]
+
+
+def test_match_one_embeds_description_when_name_hit_is_weak(
+    mock_pinecone, mock_llm, sample_candidate, monkeypatch
+):
+    seen: list[str] = []
+
+    def _embed(text, request_id=""):
+        seen.append(text)
+        return [0.1] * 8
+
+    monkeypatch.setattr(
+        "asset_master_match.services.match_service.generate_embedding",
+        _embed,
+    )
+    mock_pinecone([{**sample_candidate, "score": 0.66}])
+    mock_llm(
+        {
+            "candidate_index": 1,
+            "make_model": "8 gb ram",
+            "make_model_generated": "N",
+        }
+    )
+    result = match_one_asset(
+        {
+            "AssetName": "IIAT - 1200x650x700-1100ht",
+            "AssetDescription": "LINEAR WORKSTATION",
+        },
+        customer_id=1158,
+        request_id="t3weakdesc",
+    )
+    assert result["MatchFound"] == "Y"
+    assert seen == [
+        "IIAT - 1200x650x700-1100ht",
+        "IIAT - 1200x650x700-1100ht\nLINEAR WORKSTATION",
+    ]
 
 
 def test_match_one_without_description_embeds_name_only(
@@ -230,11 +273,9 @@ def test_match_one_without_description_embeds_name_only(
     assert seen == ["hdd 16 gb ram"]
 
 
-def test_match_one_select_error_hides_exception(
-    mock_embedding, mock_pinecone, monkeypatch
-):
+def test_match_one_select_error_hides_exception(mock_embedding, mock_pinecone, monkeypatch):
     mock_embedding()
-    mock_pinecone([{"customerid": 1004, "makemodel": "x"}])
+    mock_pinecone([{"customerid": 1004, "makemodel": "N/A", "score": 0.8}])
 
     def _boom(*_a, **_k):
         raise RuntimeError("GEMINI_API_KEY environment variable not set.")
@@ -257,9 +298,7 @@ def test_match_one_select_error_hides_exception(
 
 def test_match_one_embed_unavailable(monkeypatch):
     def _boom(*_a, **_k):
-        raise RuntimeError(
-            "503 UNAVAILABLE. This model is currently experiencing high demand."
-        )
+        raise RuntimeError("503 UNAVAILABLE. This model is currently experiencing high demand.")
 
     monkeypatch.setattr(
         "asset_master_match.services.match_service.generate_embedding",
@@ -276,11 +315,9 @@ def test_match_one_embed_unavailable(monkeypatch):
     assert "503" not in result["Message"]
 
 
-def test_match_one_select_unavailable(
-    mock_embedding, mock_pinecone, monkeypatch
-):
+def test_match_one_select_unavailable(mock_embedding, mock_pinecone, monkeypatch):
     mock_embedding()
-    mock_pinecone([{"customerid": 1004, "makemodel": "x"}])
+    mock_pinecone([{"customerid": 1004, "makemodel": "N/A", "score": 0.8}])
 
     def _boom(*_a, **_k):
         raise RuntimeError("503 UNAVAILABLE high demand")
@@ -297,16 +334,12 @@ def test_match_one_select_unavailable(
     assert result["Message"] == "Gemini selection unavailable"
 
 
-def test_match_one_select_rate_limited(
-    mock_embedding, mock_pinecone, monkeypatch
-):
-    from asset_master_match.services.gemini_service import RateLimitExceeded
-
+def test_match_one_select_rate_limited(mock_embedding, mock_pinecone, monkeypatch):
     mock_embedding()
-    mock_pinecone([{"customerid": 1004, "makemodel": "x"}])
+    mock_pinecone([{"customerid": 1004, "makemodel": "NA", "score": 0.8}])
 
     def _boom(*_a, **_k):
-        raise RateLimitExceeded("GEMINI per-minute call limit exceeded")
+        raise RuntimeError("429 RESOURCE_EXHAUSTED quota exceeded")
 
     monkeypatch.setattr(
         "asset_master_match.services.match_service.generate_json",
@@ -339,6 +372,23 @@ def test_match_one_pinecone_unavailable(mock_embedding, monkeypatch):
     assert "PINECONE_API_KEY" not in result["Message"]
 
 
+def test_match_one_rejects_weak_score(mock_embedding, mock_pinecone, mock_llm, sample_candidate):
+    mock_embedding()
+    mock_pinecone([{**sample_candidate, "score": 0.58}])
+    mock_llm({"make_model": "Project Salary"})
+    result = match_one_asset(
+        {"AssetName": "Project Salary"},
+        customer_id=1158,
+        request_id="weak",
+    )
+    assert result["MatchFound"] == "N"
+    assert result["MakeModelGenerated"] == "Y"
+    assert result["master"]["MakeModel"] == "Project Salary"
+    assert result["master"]["MakeModelId"] is None
+    assert result["master"]["CategoryId"] is None
+    assert result["Message"] == "No acceptable master match"
+
+
 def test_match_one_fallback_index_message(
     mock_embedding, mock_pinecone, mock_llm, sample_candidate
 ):
@@ -357,9 +407,52 @@ def test_match_one_fallback_index_message(
         request_id="t5",
     )
     assert result["MatchFound"] == "Y"
-    assert result["Message"] == "fallback_index"
+    assert result["Message"] is None
     assert result["master"]["MakeModel"] == "8 gb ram"
+    assert result["master"]["MakeModelId"] == 10338
     assert result["MakeModelGenerated"] == "N"
+
+
+def test_match_one_generates_when_stored_make_model_is_na(
+    mock_embedding, mock_pinecone, mock_llm, sample_candidate
+):
+    mock_embedding()
+    row = {**sample_candidate, "makemodel": "N/A", "makemodelid": 1756, "score": 0.82}
+    mock_pinecone([row])
+    mock_llm({"make_model": "Aluminium step ladder 6 ft"})
+    result = match_one_asset(
+        {"AssetName": "Aluminium step ladder 6 ft"},
+        customer_id=1158,
+        request_id="na",
+    )
+    assert result["MatchFound"] == "Y"
+    assert result["MakeModelGenerated"] == "Y"
+    assert result["master"]["MakeModel"] == "Aluminium step ladder 6 ft"
+    assert result["master"]["MakeModelId"] is None
+    assert result["master"]["CategoryId"] == 1039
+    assert result["master"]["SubCategoryId"] == 10067
+
+
+def test_match_one_master_follows_top_score(
+    mock_embedding, mock_pinecone, sample_candidate, monkeypatch
+):
+    mock_embedding()
+    low = {**sample_candidate, "makemodel": "Other model", "makemodelid": 2, "score": 0.70}
+    high = {**sample_candidate, "makemodel": "Linear Workstation Small", "makemodelid": 1003, "score": 0.91}
+    mock_pinecone([low, high])
+
+    def _boom(*_a, **_k):
+        raise AssertionError("llm should not run for a real make model")
+
+    monkeypatch.setattr("asset_master_match.services.match_service.generate_json", _boom)
+    result = match_one_asset(
+        {"AssetName": "Fixed LINEAR WORKSTATION - 1200x650"},
+        customer_id=1158,
+        request_id="stable",
+    )
+    assert result["MakeModelGenerated"] == "N"
+    assert result["master"]["MakeModel"] == "Linear Workstation Small"
+    assert result["master"]["MakeModelId"] == 1003
 
 
 def test_batch_partial_failure(
@@ -450,3 +543,118 @@ def test_multi_customer_requests_flat_results_preserve_customer_scope(
     assert sorted(seen_customers) == [1001, 1001, 1004, 1004]
     assert all(r["MatchFound"] == "Y" for r in body["results"])
     assert all(r["master"]["MakeModelId"] == 10338 for r in body["results"])
+    assert body["request_id"]
+
+
+def test_success_drops_caller_error_flag(mock_embedding, mock_pinecone, mock_llm, sample_candidate):
+    mock_embedding()
+    mock_pinecone([sample_candidate])
+    mock_llm(
+        {
+            "candidate_index": 1,
+            "make_model": "8 gb ram",
+            "make_model_generated": "N",
+        }
+    )
+    result = match_one_asset(
+        {
+            "AssetName": "hdd 8 gb ram",
+            "Error": True,
+            "Message": "from caller",
+            "MatchFound": "N",
+            "master": {"MakeModel": "injected"},
+        },
+        customer_id=1004,
+        request_id="echo",
+    )
+    assert result["MatchFound"] == "Y"
+    assert result["Message"] is None
+    assert "Error" not in result
+    assert result["master"]["MakeModel"] == "8 gb ram"
+
+
+def test_past_deadline_skips_embed(monkeypatch):
+    def _boom(*_a, **_k):
+        raise AssertionError("embed should not run after the deadline")
+
+    monkeypatch.setattr(match_service, "generate_embedding", _boom)
+    result = match_one_asset(
+        {"AssetName": "pump"},
+        customer_id=1004,
+        request_id="dead",
+        deadline=time.monotonic() - 1,
+    )
+    assert result["Message"] == MSG_TIMED_OUT
+    assert result["Error"] is True
+    assert result["MatchFound"] == "N"
+
+
+def test_batch_deadline_returns_finished_rows(make_http_request, monkeypatch):
+    monkeypatch.setattr(match_service, "BATCH_DEADLINE_SEC", 0.4)
+
+    def _match(asset, *, customer_id, request_id, deadline=None):
+        if asset["AssetName"] == "slow":
+            time.sleep(2)
+        return {
+            "CustomerId": customer_id,
+            "AssetName": asset["AssetName"],
+            "master": {"MakeModel": "kept"},
+            "MatchFound": "Y",
+            "MakeModelGenerated": "N",
+            "Message": None,
+        }
+
+    monkeypatch.setattr(match_service, "match_one_asset", _match)
+    resp = run_asset_master_match(
+        make_http_request(
+            {
+                "CustomerId": 1004,
+                "assets": [
+                    {"AssetName": "fast"},
+                    {"AssetName": "slow"},
+                ],
+            }
+        )
+    )
+    assert resp.status_code == 200
+    body = _body(resp)
+    by_name = {row["AssetName"]: row for row in body["results"]}
+    assert by_name["fast"]["MatchFound"] == "Y"
+    assert by_name["slow"]["Message"] == MSG_TIMED_OUT
+    assert by_name["slow"]["Error"] is True
+
+
+def test_http_503_when_every_row_is_upstream(make_http_request, monkeypatch):
+    def _boom(*_a, **_k):
+        raise RuntimeError("503 UNAVAILABLE")
+
+    monkeypatch.setattr(match_service, "generate_embedding", _boom)
+    resp = run_asset_master_match(
+        make_http_request(
+            {
+                "CustomerId": 1004,
+                "assets": [{"AssetName": "pump"}, {"AssetName": "laptop"}],
+            }
+        )
+    )
+    assert resp.status_code == 503
+    body = _body(resp)
+    assert body["request_id"]
+    assert [row["Message"] for row in body["results"]] == [
+        "Embedding service unavailable",
+        "Embedding service unavailable",
+    ]
+
+
+def test_http_200_when_no_candidates(make_http_request, mock_embedding, mock_pinecone, mock_llm):
+    mock_embedding()
+    mock_pinecone([])
+    mock_llm({"make_model": "unknown"})
+    resp = run_asset_master_match(
+        make_http_request({"CustomerId": 1004, "assets": [{"AssetName": "unknown"}]})
+    )
+    assert resp.status_code == 200
+    body = _body(resp)
+    assert body["request_id"]
+    assert body["results"][0]["Message"] == "No master data candidates found"
+    assert "Error" not in body["results"][0]

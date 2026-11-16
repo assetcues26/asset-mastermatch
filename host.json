@@ -19,5 +19,5 @@
       "dynamicThrottlesEnabled": true
     }
   },
-  "functionTimeout": "00:02:00"
+  "functionTimeout": "00:04:00"
 }

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -11,16 +13,17 @@ from typing import Any
 import azure.functions as func
 
 from asset_master_match.core.config import (
+    BATCH_DEADLINE_SEC,
     MAX_ASSET_DESCRIPTION_LENGTH,
     MAX_ASSET_NAME_LENGTH,
     MAX_ASSETS_PER_REQUEST,
     MAX_EMBED_QUERY_LENGTH,
     MAX_MAKE_MODEL_LENGTH,
     MAX_PARALLEL_ITEMS,
+    MIN_MATCH_SCORE,
+    PINECONE_TOP_K,
 )
-from asset_master_match.prompts.builders import build_select_prompt
 from asset_master_match.services.gemini_service import (
-    RateLimitExceeded,
     generate_embedding,
     generate_json,
 )
@@ -54,6 +57,7 @@ MSG_FALLBACK_INDEX = "fallback_index"
 MSG_ASSET_NAME_REQUIRED = "AssetName is required"
 MSG_ASSET_NAME_TOO_LONG = "AssetName exceeds maximum length"
 MSG_NO_CANDIDATES = "No master data candidates found"
+MSG_NO_ACCEPTABLE_MATCH = "No acceptable master match"
 MSG_EMBED_FAILED = "Failed to embed AssetName"
 MSG_EMBED_UNAVAILABLE = "Embedding service unavailable"
 MSG_EMBED_ERROR = "Embedding service error"
@@ -62,6 +66,116 @@ MSG_SELECT_UNAVAILABLE = "Gemini selection unavailable"
 MSG_SELECT_ERROR = "Failed to select master match"
 MSG_SELECT_RATE_LIMITED = "Gemini rate limit hit"
 MSG_PIPELINE_ERROR = "Match pipeline error"
+MSG_TIMED_OUT = "Match timed out"
+
+# Caller fields with these names are not copied onto the result. This service sets them.
+_RESERVED_RESULT_KEYS = frozenset(
+    {
+        "CustomerId",
+        "master",
+        "MatchFound",
+        "MakeModelGenerated",
+        "Message",
+        "Error",
+    }
+)
+
+_TOKEN = re.compile(r"[a-z0-9]+")
+_INVOICE = re.compile(r"\b(inv|invoice|charges)\b|\d{6,}", re.IGNORECASE)
+_MIN_TOKEN_LEN = 4
+_MIN_SNAP_LEN = 8
+
+
+def _score(row: dict[str, Any]) -> float | None:
+    try:
+        return float(row.get("score"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _best_score(rows: list[dict[str, Any]]) -> float | None:
+    scores = [score for row in rows if (score := _score(row)) is not None]
+    return max(scores) if scores else None
+
+
+def _tokens(text: Any) -> list[str]:
+    return [
+        token
+        for token in _TOKEN.findall(normalize_text(text).casefold())
+        if len(token) >= _MIN_TOKEN_LEN
+    ]
+
+
+def _fit(asset_name: str, make_model: Any) -> tuple[int, int]:
+    """(matched tokens, negative unmatched) so a closer name sorts first."""
+    tokens = _tokens(make_model)
+    if not tokens:
+        return (0, 0)
+    asset = set(_tokens(asset_name))
+    matched = sum(1 for token in tokens if token in asset)
+    return (matched, -(len(tokens) - matched))
+
+
+def _shares_long_token(asset_name: str, make_model: Any) -> bool:
+    asset = set(_tokens(asset_name))
+    return any(token in asset for token in _tokens(make_model))
+
+
+def _looks_like_invoice(text: str) -> bool:
+    return bool(_INVOICE.search(text))
+
+
+def _merge_candidates(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the higher score when name-only and description search return the same row."""
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for group in groups:
+        for row in group:
+            key = str(row.get("_id") or row.get("makemodelid") or id(row))
+            current = merged.get(key)
+            if current is None:
+                merged[key] = row
+                order.append(key)
+                continue
+            if (_score(row) or 0) > (_score(current) or 0):
+                merged[key] = row
+    rows = [merged[key] for key in order]
+    rows.sort(key=lambda row: _score(row) or 0, reverse=True)
+    return rows[: max(PINECONE_TOP_K, 8)]
+
+
+def _snap_to_existing(
+    proposed: str, candidates: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Use the master whose MakeModel is already inside the rewritten text."""
+    proposed_norm = normalize_text(proposed).casefold()
+    best: dict[str, Any] | None = None
+    best_len = 0
+    for row in candidates:
+        make_model = safe_str(row.get("makemodel")) or ""
+        norm = normalize_text(make_model).casefold()
+        if len(norm) < _MIN_SNAP_LEN or norm not in proposed_norm:
+            continue
+        if len(norm) > best_len:
+            best = row
+            best_len = len(norm)
+    return best
+
+
+# Every row carrying one of these means the upstream call failed, not the input.
+_UPSTREAM_MESSAGES = frozenset(
+    {
+        MSG_EMBED_FAILED,
+        MSG_EMBED_UNAVAILABLE,
+        MSG_EMBED_ERROR,
+        MSG_PINECONE_UNAVAILABLE,
+        MSG_SELECT_UNAVAILABLE,
+        MSG_SELECT_ERROR,
+        MSG_SELECT_RATE_LIMITED,
+        MSG_PIPELINE_ERROR,
+        MSG_TIMED_OUT,
+    }
+)
 
 
 def _log_stage_failure(item_id: str, stage: str, exc: BaseException) -> None:
@@ -90,8 +204,6 @@ def _is_unavailable_exc(exc: BaseException) -> bool:
 
 
 def _is_rate_limit_exc(exc: BaseException) -> bool:
-    if isinstance(exc, RateLimitExceeded):
-        return True
     text = f"{type(exc).__name__}: {exc}".lower()
     return any(
         token in text
@@ -136,7 +248,7 @@ def _echo_input(asset: dict[str, Any], customer_id: int) -> dict[str, Any]:
             echoed[key] = asset[key]
     # Preserve any extra caller fields without inventing names.
     for key, value in asset.items():
-        if key not in echoed and key not in ("CustomerId",):
+        if key not in echoed and key not in _RESERVED_RESULT_KEYS:
             echoed[key] = value
     return echoed
 
@@ -171,6 +283,42 @@ def _no_match_result(echoed: dict[str, Any], message: str) -> dict[str, Any]:
     }
 
 
+def _generated_without_master(
+    echoed: dict[str, Any],
+    asset_name: str,
+    asset_description: str,
+    request_id: str,
+    message: str,
+    deadline: float | None,
+) -> dict[str, Any]:
+    """No master row fit. Still return a MakeModel so the output is not blank."""
+    if _deadline_hit(deadline):
+        return _error_result(echoed, MSG_TIMED_OUT)
+    proposed = ""
+    try:
+        proposed = _generate_make_model_text(asset_name, asset_description, request_id)
+    except Exception as exc:
+        _log_stage_failure(request_id, "select", exc)
+    if _is_placeholder_make_model(proposed):
+        proposed = sanitize_make_model(asset_name, MAX_MAKE_MODEL_LENGTH)
+    return {
+        **echoed,
+        "master": {
+            "AssetClass": None,
+            "AssetClassId": None,
+            "Category": None,
+            "CategoryId": None,
+            "SubCategory": None,
+            "SubCategoryId": None,
+            "MakeModel": proposed,
+            "MakeModelId": None,
+        },
+        "MatchFound": "N",
+        "MakeModelGenerated": "Y",
+        "Message": message,
+    }
+
+
 def _error_result(echoed: dict[str, Any], message: str) -> dict[str, Any]:
     return {
         **echoed,
@@ -186,13 +334,16 @@ def _apply_llm_choice(
     asset_name: str,
     candidates: list[dict[str, Any]],
     llm: dict[str, Any],
-) -> tuple[dict[str, Any], str, str | None]:
+) -> tuple[dict[str, Any] | None, str, str | None]:
     """Return (master, make_model_generated, message).
 
     ``message`` is a fixed status string from this service (never LLM prose).
     Classification always comes from the chosen candidate.
+    ``master`` is None when the model reports that nothing fits.
     """
     index = to_int_or_none(llm.get("candidate_index"))
+    if index == 0:
+        return None, "N", MSG_NO_ACCEPTABLE_MATCH
     if index is None or index < 1 or index > len(candidates):
         # Fallback: first candidate; keep its MakeModel.
         chosen = candidates[0]
@@ -233,6 +384,30 @@ def _apply_llm_choice(
                 proposed = pinecone_mm
                 generated = False
 
+    # "LINEAR WORKSTATION - 1200x650" still is the existing LINEAR WORKSTATION row.
+    if generated:
+        snapped = _snap_to_existing(proposed, candidates)
+        if snapped is not None:
+            chosen = snapped
+            proposed = safe_str(snapped.get("makemodel")) or proposed
+            pinecone_mm = proposed
+            generated = False
+
+    # Prefer the candidate whose MakeModel actually shares the asset's model tokens.
+    best = max(candidates, key=lambda row: _fit(asset_name, row.get("makemodel")))
+    best_fit = _fit(asset_name, best.get("makemodel"))
+    chosen_fit = _fit(asset_name, chosen.get("makemodel"))
+    if best_fit[0] >= 2 and best_fit > chosen_fit:
+        chosen = best
+        proposed = safe_str(chosen.get("makemodel")) or ""
+        pinecone_mm = proposed
+        generated = False
+
+    # A related master already exists. Do not mint a new MakeModel from the asset text.
+    if generated and _shares_long_token(asset_name, pinecone_mm):
+        proposed = pinecone_mm
+        generated = False
+
     flag = "Y" if generated else "N"
     master = _master_from_candidate(
         chosen,
@@ -250,11 +425,56 @@ def _apply_llm_choice(
     return master, flag, None
 
 
+_PLACEHOLDER_MAKE_MODELS = frozenset(
+    {"", "na", "none", "null", "nil", "notavailable", "notapplicable"}
+)
+
+
+def _is_placeholder_make_model(value: Any) -> bool:
+    compact = re.sub(r"[^a-z0-9]", "", normalize_text(value).casefold())
+    return compact in _PLACEHOLDER_MAKE_MODELS
+
+
+def _stable_master(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Highest Pinecone score, then lowest MakeModelId. Same input, same row."""
+
+    def sort_key(row: dict[str, Any]) -> tuple[float, int, str]:
+        score = _score(row)
+        mmid = to_int_or_none(row.get("makemodelid"))
+        return (
+            -(score if score is not None else -1.0),
+            mmid if mmid is not None else 10**12,
+            str(row.get("_id") or ""),
+        )
+
+    return sorted(candidates, key=sort_key)[0]
+
+
+def _generate_make_model_text(asset_name: str, asset_description: str, request_id: str) -> str:
+    """Fill a blank or N/A MakeModel. Does not choose a different master row."""
+    prompt = (
+        "The matched master row has no MakeModel (it is N/A). "
+        "Write the MakeModel text for this asset. "
+        "Use AssetName. Add a concrete size or model from AssetDescription only when it belongs to that product. "
+        "Do not answer N/A, NA, or empty. "
+        'Return only JSON: {"make_model": "<text>"}\n'
+        f"<asset_name>\n{asset_name}\n</asset_name>\n"
+        f"<asset_description>\n{asset_description or '(none)'}\n</asset_description>"
+    )
+    data = generate_json(prompt, request_id=request_id)
+    return safe_str(data.get("make_model")) or ""
+
+
+def _deadline_hit(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
 def match_one_asset(
     asset: dict[str, Any],
     *,
     customer_id: int,
     request_id: str,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     echoed = _echo_input(asset, customer_id)
     asset_name = normalize_text(asset.get("AssetName"))
@@ -262,6 +482,8 @@ def match_one_asset(
         return _error_result(echoed, MSG_ASSET_NAME_REQUIRED)
     if len(asset_name) > MAX_ASSET_NAME_LENGTH:
         return _error_result(echoed, MSG_ASSET_NAME_TOO_LONG)
+    if _deadline_hit(deadline):
+        return _error_result(echoed, MSG_TIMED_OUT)
 
     # Optional; empty/whitespace treated as absent. Overlong text is truncated in
     # build_embed_query / prompt builders (do not fail the item).
@@ -271,53 +493,112 @@ def match_one_asset(
     asset_class_id = to_int_or_none(asset.get("AssetClassId"))
     item_id = f"{request_id}:{asset_name[:40]}"
 
-    query_text = build_embed_query(
-        asset_name,
-        asset_description or None,
-        max_description_length=MAX_ASSET_DESCRIPTION_LENGTH,
-        max_embed_query_length=MAX_EMBED_QUERY_LENGTH,
-    )
-
+    if _deadline_hit(deadline):
+        return _error_result(echoed, MSG_TIMED_OUT)
     try:
-        embedding = generate_embedding(query_text, request_id=item_id)
+        name_embedding = generate_embedding(asset_name, request_id=item_id)
     except Exception as exc:
         _log_stage_failure(item_id, "embed", exc)
         return _error_result(echoed, _message_for_embed_exc(exc))
-    if not embedding:
+    if not name_embedding:
         return _error_result(echoed, MSG_EMBED_FAILED)
 
+    if _deadline_hit(deadline):
+        return _error_result(echoed, MSG_TIMED_OUT)
     try:
         candidates = query_masterdata(
-            embedding,
+            name_embedding,
             customer_id=customer_id,
             category_id=category_id,
             asset_class_id=asset_class_id,
             request_id=item_id,
         )
+        # A short product description can name the real master when the asset
+        # name is only a size. Invoice text is left out so it cannot pull a
+        # different product into the top hits.
+        desc_useful = (
+            bool(asset_description)
+            and asset_description.casefold() != asset_name.casefold()
+            and len(asset_description) <= 80
+            and not _looks_like_invoice(asset_description)
+            and (_best_score(candidates) or 0) < 0.75
+        )
+        if desc_useful and not _deadline_hit(deadline):
+            try:
+                query_text = build_embed_query(
+                    asset_name,
+                    asset_description,
+                    max_description_length=MAX_ASSET_DESCRIPTION_LENGTH,
+                    max_embed_query_length=MAX_EMBED_QUERY_LENGTH,
+                )
+                desc_embedding = generate_embedding(query_text, request_id=item_id)
+                if desc_embedding:
+                    described = query_masterdata(
+                        desc_embedding,
+                        customer_id=customer_id,
+                        category_id=category_id,
+                        asset_class_id=asset_class_id,
+                        request_id=item_id,
+                    )
+                    candidates = _merge_candidates(candidates, described)
+            except Exception as exc:
+                _log_stage_failure(item_id, "description-search", exc)
     except Exception as exc:
         _log_stage_failure(item_id, "pinecone", exc)
         return _error_result(echoed, MSG_PINECONE_UNAVAILABLE)
     if not candidates:
-        return _no_match_result(echoed, MSG_NO_CANDIDATES)
-
-    try:
-        prompt = build_select_prompt(
+        return _generated_without_master(
+            echoed,
             asset_name,
-            candidates,
-            asset_description=asset_description,
+            asset_description,
+            item_id,
+            MSG_NO_CANDIDATES,
+            deadline,
         )
-        llm = generate_json(prompt, request_id=item_id)
-        master, generated, message = _apply_llm_choice(asset_name, candidates, llm)
+    best = _best_score(candidates)
+    if best is not None and best < MIN_MATCH_SCORE:
+        return _generated_without_master(
+            echoed,
+            asset_name,
+            asset_description,
+            item_id,
+            MSG_NO_ACCEPTABLE_MATCH,
+            deadline,
+        )
+
+    chosen = _stable_master(candidates)
+    stored = safe_str(chosen.get("makemodel")) or ""
+    if not _is_placeholder_make_model(stored):
         return {
             **echoed,
-            "master": master,
+            "master": _master_from_candidate(
+                chosen, make_model=stored, make_model_generated="N"
+            ),
             "MatchFound": "Y",
-            "MakeModelGenerated": generated,
-            "Message": message,
+            "MakeModelGenerated": "N",
+            "Message": None,
         }
+
+    if _deadline_hit(deadline):
+        return _error_result(echoed, MSG_TIMED_OUT)
+    try:
+        proposed = _generate_make_model_text(
+            asset_name, asset_description, item_id
+        )
     except Exception as exc:
         _log_stage_failure(item_id, "select", exc)
         return _error_result(echoed, _message_for_select_exc(exc))
+    if _is_placeholder_make_model(proposed):
+        proposed = sanitize_make_model(asset_name, MAX_MAKE_MODEL_LENGTH)
+    return {
+        **echoed,
+        "master": _master_from_candidate(
+            chosen, make_model=proposed, make_model_generated="Y"
+        ),
+        "MatchFound": "Y",
+        "MakeModelGenerated": "Y",
+        "Message": None,
+    }
 
 
 def _parse_body(req: func.HttpRequest) -> dict[str, Any]:
@@ -377,47 +658,85 @@ def _normalize_work_items(
     return work, None
 
 
+def _store_finished(
+    future: Any,
+    idx: int,
+    work: list[tuple[int, dict[str, Any]]],
+    results_slot: list[dict[str, Any] | None],
+    request_id: str,
+) -> None:
+    if results_slot[idx] is not None or not future.done() or future.cancelled():
+        return
+    customer_id, asset = work[idx]
+    try:
+        results_slot[idx] = future.result()
+    except Exception as exc:
+        _log_stage_failure(f"{request_id}:worker[{idx}]", "pipeline", exc)
+        results_slot[idx] = _error_result(
+            _echo_input(asset, customer_id),
+            MSG_PIPELINE_ERROR,
+        )
+
+
 def _run_work_items(
     work: list[tuple[int, dict[str, Any]]],
     *,
     request_id: str,
 ) -> list[dict[str, Any]]:
-    """Match each asset with its own customer_id; preserve input order in flat results."""
-    if len(work) == 1:
-        customer_id, asset = work[0]
-        return [
-            match_one_asset(
-                asset,
-                customer_id=customer_id,
-                request_id=request_id,
-            )
-        ]
+    """Match each asset with its own customer_id; preserve input order in flat results.
 
+    Stops waiting at ``BATCH_DEADLINE_SEC`` and fills unfinished rows in place, so the
+    host timeout is not what ends the request.
+    """
     results_slot: list[dict[str, Any] | None] = [None] * len(work)
     workers = max(1, min(MAX_PARALLEL_ITEMS, len(work)))
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                match_one_asset,
-                asset,
-                customer_id=customer_id,
-                request_id=request_id,
-            ): idx
-            for idx, (customer_id, asset) in enumerate(work)
-        }
-        for future in as_completed(futures):
-            idx = futures[future]
+    deadline = time.monotonic() + BATCH_DEADLINE_SEC
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures = {
+        pool.submit(
+            match_one_asset,
+            asset,
+            customer_id=customer_id,
+            request_id=request_id,
+            deadline=deadline,
+        ): idx
+        for idx, (customer_id, asset) in enumerate(work)
+    }
+    try:
+        for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
+            _store_finished(future, futures[future], work, results_slot, request_id)
+    except TimeoutError:
+        logging.warning(
+            "[%s] batch deadline %.0fs exceeded",
+            request_id,
+            BATCH_DEADLINE_SEC,
+        )
+    for future, idx in futures.items():
+        _store_finished(future, idx, work, results_slot, request_id)
+    timed_out = 0
+    for future, idx in futures.items():
+        if results_slot[idx] is not None:
+            continue
+        future.cancel()
+        _store_finished(future, idx, work, results_slot, request_id)
+        if results_slot[idx] is None:
             customer_id, asset = work[idx]
-            try:
-                results_slot[idx] = future.result()
-            except Exception as exc:
-                _log_stage_failure(f"{request_id}:worker[{idx}]", "pipeline", exc)
-                results_slot[idx] = _error_result(
-                    _echo_input(asset, customer_id),
-                    MSG_PIPELINE_ERROR,
-                )
+            results_slot[idx] = _error_result(
+                _echo_input(asset, customer_id),
+                MSG_TIMED_OUT,
+            )
+            timed_out += 1
+    pool.shutdown(wait=False, cancel_futures=True)
+    if timed_out:
+        logging.warning("[%s] %s asset(s) marked timed out", request_id, timed_out)
     return [item for item in results_slot if item is not None]
+
+
+def _http_status_for_results(results: list[dict[str, Any]]) -> int:
+    """503 only when every row failed because an upstream call or the deadline did."""
+    if results and all(item.get("Message") in _UPSTREAM_MESSAGES for item in results):
+        return 503
+    return 200
 
 
 def run_asset_master_match(req: func.HttpRequest) -> func.HttpResponse:
@@ -427,11 +746,11 @@ def run_asset_master_match(req: func.HttpRequest) -> func.HttpResponse:
     try:
         body = _parse_body(req)
     except ValueError as exc:
-        return _json_response({"error": str(exc)}, status=400)
+        return _json_response({"request_id": request_id, "error": str(exc)}, status=400)
 
     work, err = _normalize_work_items(body)
     if err:
-        return _json_response({"error": err}, status=400)
+        return _json_response({"request_id": request_id, "error": err}, status=400)
 
     results = _run_work_items(work, request_id=request_id)
 
@@ -447,6 +766,8 @@ def run_asset_master_match(req: func.HttpRequest) -> func.HttpResponse:
                 item.get("AssetName"),
             )
 
-    # Flat results only — each row echoes its own CustomerId (no mixed top-level id).
-    return _json_response({"results": results})
-
+    # Each row echoes its own CustomerId (no mixed top-level id).
+    return _json_response(
+        {"request_id": request_id, "results": results},
+        status=_http_status_for_results(results),
+    )

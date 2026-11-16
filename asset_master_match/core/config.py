@@ -27,13 +27,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # Gemini
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.1-flash-lite")
 GEMINI_CALL_TIMEOUT_SEC = _env_float("GEMINI_CALL_TIMEOUT_SEC", 30.0)
-GEMINI_MAX_RETRIES = _env_int("GEMINI_MAX_RETRIES", 3)
 GEMINI_MAX_INPUT_TOKENS = _env_int("GEMINI_MAX_INPUT_TOKENS", 8000)
 GEMINI_MAX_OUTPUT_TOKENS = _env_int("GEMINI_MAX_OUTPUT_TOKENS", 1500)
 GEMINI_DEFAULT_OUTPUT_TOKENS = _env_int("GEMINI_DEFAULT_OUTPUT_TOKENS", 800)
-GEMINI_MAX_CALLS_PER_MINUTE = _env_int("GEMINI_MAX_CALLS_PER_MINUTE", 120)
-GEMINI_MAX_CALLS_PER_HOUR = _env_int("GEMINI_MAX_CALLS_PER_HOUR", 500)
-GEMINI_MAX_CALLS_PER_DAY = _env_int("GEMINI_MAX_CALLS_PER_DAY", 5000)
 
 # Prompt char budget (~4 chars/token), overridable via GEMINI_MAX_PROMPT_CHARS
 MAX_PROMPT_LENGTH = _env_int(
@@ -44,13 +40,19 @@ MAX_PROMPT_LENGTH = _env_int(
 # Embeddings
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "gemini-embedding-001")
 EMBEDDING_DIMENSION = _env_int("EMBEDDING_DIMENSION", 1536)
+EMBED_CALL_TIMEOUT_SEC = _env_float("EMBED_CALL_TIMEOUT_SEC", 15.0)
 
 # Pinecone
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "")
 PINECONE_TOP_K = _env_int("PINECONE_TOP_K", 5)
-PINECONE_MAX_CALLS_PER_MINUTE = _env_int("PINECONE_MAX_CALLS_PER_MINUTE", 100)
-PINECONE_MAX_CALLS_PER_HOUR = _env_int("PINECONE_MAX_CALLS_PER_HOUR", 1000)
-PINECONE_MAX_CALLS_PER_DAY = _env_int("PINECONE_MAX_CALLS_PER_DAY", 10000)
+PINECONE_CALL_TIMEOUT_SEC = _env_float("PINECONE_CALL_TIMEOUT_SEC", 10.0)
+# Best Pinecone score below this is not a match. Stops generic lines
+# ("Building works", "Project Salary") from attaching a random nearby master.
+MIN_MATCH_SCORE = _env_float("MIN_MATCH_SCORE", 0.64)
+
+# Stop waiting and return finished rows before the host kills the invocation.
+# host.json functionTimeout is 4 minutes so this deadline wins.
+BATCH_DEADLINE_SEC = _env_float("BATCH_DEADLINE_SEC", 90.0)
 
 # Request / field limits
 MAX_ASSETS_PER_REQUEST = _env_int("MAX_ASSETS_PER_REQUEST", 50)

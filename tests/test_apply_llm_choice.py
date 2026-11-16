@@ -76,6 +76,60 @@ def test_apply_llm_text_changed_but_flag_n_becomes_y(sample_candidate):
     assert master["MakeModelId"] is None
 
 
+def test_apply_llm_zero_index_is_no_match(sample_candidate):
+    master, flag, message = _apply_llm_choice(
+        "Project Salary",
+        [sample_candidate],
+        {"candidate_index": 0, "make_model": "", "make_model_generated": "N"},
+    )
+    assert master is None
+    assert flag == "N"
+    assert message == "No acceptable master match"
+
+
+def test_apply_llm_keeps_existing_when_rewrite_only_adds_size(sample_candidate):
+    row = {**sample_candidate, "makemodel": "LINEAR WORKSTATION", "makemodelid": 1752}
+    master, flag, message = _apply_llm_choice(
+        "Fixed LINEAR WORKSTATION - 1200x650",
+        [row],
+        {
+            "candidate_index": 1,
+            "make_model": "LINEAR WORKSTATION - 1200x650",
+            "make_model_generated": "Y",
+        },
+    )
+    assert message is None
+    assert flag == "N"
+    assert master["MakeModel"] == "LINEAR WORKSTATION"
+    assert master["MakeModelId"] == 1752
+
+
+def test_apply_llm_prefers_closer_model_code(sample_candidate):
+    vague = {
+        **sample_candidate,
+        "makemodel": "Cisco Catalyst Edge C8300-1N1S-6T",
+        "makemodelid": 1477,
+    }
+    exact = {
+        **sample_candidate,
+        "makemodel": "Cisco C8300-1N1S-6T",
+        "makemodelid": 1128,
+    }
+    master, flag, message = _apply_llm_choice(
+        "CISCO-C8300-1N1S-6T Router",
+        [vague, exact],
+        {
+            "candidate_index": 1,
+            "make_model": "Cisco Catalyst Edge C8300-1N1S",
+            "make_model_generated": "Y",
+        },
+    )
+    assert message is None
+    assert flag == "N"
+    assert master["MakeModel"] == "Cisco C8300-1N1S-6T"
+    assert master["MakeModelId"] == 1128
+
+
 def test_apply_llm_bad_index_falls_back_to_first(sample_candidate):
     other = {**sample_candidate, "makemodel": "other", "makemodelid": 1}
     master, flag, message = _apply_llm_choice(

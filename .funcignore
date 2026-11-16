@@ -41,3 +41,7 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Local match console. Never publish this with the function app.
+frontend/
+frontend/**

@@ -6,68 +6,19 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime
 from typing import Any
 
 from pinecone import Pinecone
 
 from asset_master_match.core.config import (
+    PINECONE_CALL_TIMEOUT_SEC,
     PINECONE_INDEX_NAME,
-    PINECONE_MAX_CALLS_PER_DAY,
-    PINECONE_MAX_CALLS_PER_HOUR,
-    PINECONE_MAX_CALLS_PER_MINUTE,
     PINECONE_TOP_K,
 )
 from asset_master_match.utils.helpers import to_int_or_none
 
 _index = None
 _index_lock = threading.Lock()
-
-
-class PineconeRateLimiter:
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.minute_calls = 0
-        self.hourly_calls = 0
-        self.daily_calls = 0
-        self.last_reset_minute = None
-        self.last_reset_hour = None
-        self.last_reset_day = None
-
-    def check_and_record(self) -> None:
-        with self.lock:
-            now = datetime.now()
-            if self.last_reset_day is None:
-                self.last_reset_day = now.day
-                self.last_reset_hour = now.hour
-                self.last_reset_minute = now.minute
-            if now.day != self.last_reset_day:
-                self.daily_calls = 0
-                self.last_reset_day = now.day
-            if now.hour != self.last_reset_hour:
-                self.hourly_calls = 0
-                self.last_reset_hour = now.hour
-            if now.minute != self.last_reset_minute:
-                self.minute_calls = 0
-                self.last_reset_minute = now.minute
-            if self.minute_calls >= PINECONE_MAX_CALLS_PER_MINUTE:
-                raise RuntimeError(
-                    f"Pinecone rate limit: {PINECONE_MAX_CALLS_PER_MINUTE}/min exceeded"
-                )
-            if self.hourly_calls >= PINECONE_MAX_CALLS_PER_HOUR:
-                raise RuntimeError(
-                    f"Pinecone rate limit: {PINECONE_MAX_CALLS_PER_HOUR}/hour exceeded"
-                )
-            if self.daily_calls >= PINECONE_MAX_CALLS_PER_DAY:
-                raise RuntimeError(
-                    f"Pinecone rate limit: {PINECONE_MAX_CALLS_PER_DAY}/day exceeded"
-                )
-            self.minute_calls += 1
-            self.hourly_calls += 1
-            self.daily_calls += 1
-
-
-_rate_limiter = PineconeRateLimiter()
 
 
 def get_pinecone_index():
@@ -140,7 +91,6 @@ def query_masterdata(
     if not embedding:
         return []
 
-    _rate_limiter.check_and_record()
     metadata_filter = build_metadata_filter(customer_id, category_id, asset_class_id)
     index = get_pinecone_index()
     k = top_k if top_k is not None else PINECONE_TOP_K
@@ -151,6 +101,7 @@ def query_masterdata(
         top_k=k,
         filter=metadata_filter,
         include_metadata=True,
+        timeout=PINECONE_CALL_TIMEOUT_SEC,
     )
     elapsed_ms = (time.time() - start) * 1000
 

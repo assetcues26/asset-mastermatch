@@ -1,4 +1,4 @@
-"""Gemini text client — timeouts, retries, and simple rate limits."""
+"""Gemini text client — per-call timeouts and one retry for timeouts / 503."""
 
 from __future__ import annotations
 
@@ -8,19 +8,18 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
 from typing import Any
 
+import httpx
 from google import genai
 from google.genai import types
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_fixed
 
 from asset_master_match.core.config import (
+    EMBED_CALL_TIMEOUT_SEC,
+    EMBEDDING_DIMENSION,
+    EMBEDDING_MODEL_NAME,
     GEMINI_CALL_TIMEOUT_SEC,
-    GEMINI_MAX_CALLS_PER_DAY,
-    GEMINI_MAX_CALLS_PER_HOUR,
-    GEMINI_MAX_CALLS_PER_MINUTE,
-    GEMINI_MAX_RETRIES,
     GEMINI_MODEL_NAME,
     MAX_PROMPT_LENGTH,
     clamp_output_tokens,
@@ -29,21 +28,12 @@ from asset_master_match.core.config import (
 _client: genai.Client | None = None
 _client_lock = threading.Lock()
 
-_usage = {
-    "daily_calls": 0,
-    "hourly_calls": 0,
-    "minute_calls": 0,
-    "last_reset_day": None,
-    "last_reset_hour": None,
-    "last_reset_minute": None,
-    "lock": threading.Lock(),
-}
-
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
-
-class RateLimitExceeded(Exception):
-    """Local call-cap exceeded — must not be retried by tenacity."""
+# One extra attempt only. 429 stays a single failure so quota errors are not multiplied.
+_SELECT_ATTEMPTS = 2
+_SELECT_RETRY_BACKOFF_SEC = 1
+_RETRYABLE_STATUS_CODES = frozenset({503, 504})
 
 
 class PromptTooLongError(ValueError):
@@ -61,33 +51,19 @@ def get_genai_client() -> genai.Client:
         return _client
 
 
-def _check_rate_limits() -> None:
-    with _usage["lock"]:
-        now = datetime.now()
-        if _usage["last_reset_day"] is None:
-            _usage["last_reset_day"] = now.day
-            _usage["last_reset_hour"] = now.hour
-            _usage["last_reset_minute"] = now.minute
-        if now.day != _usage["last_reset_day"]:
-            _usage["daily_calls"] = 0
-            _usage["last_reset_day"] = now.day
-        if now.hour != _usage["last_reset_hour"]:
-            _usage["hourly_calls"] = 0
-            _usage["last_reset_hour"] = now.hour
-        if now.minute != _usage["last_reset_minute"]:
-            _usage["minute_calls"] = 0
-            _usage["last_reset_minute"] = now.minute
+def _http_options(timeout_sec: float) -> types.HttpOptions:
+    """Per-call timeout. The SDK itself does not retry (attempts=1)."""
+    return types.HttpOptions(
+        timeout=max(1, int(timeout_sec * 1000)),
+        retry_options=types.HttpRetryOptions(attempts=1),
+    )
 
-        if _usage["daily_calls"] >= GEMINI_MAX_CALLS_PER_DAY:
-            raise RateLimitExceeded("GEMINI daily call limit exceeded")
-        if _usage["hourly_calls"] >= GEMINI_MAX_CALLS_PER_HOUR:
-            raise RateLimitExceeded("GEMINI hourly call limit exceeded")
-        if _usage["minute_calls"] >= GEMINI_MAX_CALLS_PER_MINUTE:
-            raise RateLimitExceeded("GEMINI per-minute call limit exceeded")
 
-        _usage["daily_calls"] += 1
-        _usage["hourly_calls"] += 1
-        _usage["minute_calls"] += 1
+def _retry_select(exc: BaseException) -> bool:
+    """Retry a select once on transport timeouts and 503/504. Never on 429."""
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+        return True
+    return getattr(exc, "code", None) in _RETRYABLE_STATUS_CODES
 
 
 def parse_json_response(text: str) -> dict[str, Any]:
@@ -111,9 +87,9 @@ def parse_json_response(text: str) -> dict[str, Any]:
 
 
 @retry(
-    retry=retry_if_exception_type((TimeoutError, ConnectionError)),
-    stop=stop_after_attempt(GEMINI_MAX_RETRIES),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
+    retry=retry_if_exception(_retry_select),
+    stop=stop_after_attempt(_SELECT_ATTEMPTS),
+    wait=wait_fixed(_SELECT_RETRY_BACKOFF_SEC),
     reraise=True,
 )
 def generate_json(
@@ -124,11 +100,8 @@ def generate_json(
     request_id: str = "",
 ) -> dict[str, Any]:
     if len(prompt) > MAX_PROMPT_LENGTH:
-        raise PromptTooLongError(
-            f"Prompt length {len(prompt)} exceeds max {MAX_PROMPT_LENGTH}"
-        )
+        raise PromptTooLongError(f"Prompt length {len(prompt)} exceeds max {MAX_PROMPT_LENGTH}")
 
-    _check_rate_limits()
     model = model_name or GEMINI_MODEL_NAME
     client = get_genai_client()
     start = time.time()
@@ -136,9 +109,9 @@ def generate_json(
         model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0,
             max_output_tokens=clamp_output_tokens(max_output_tokens),
-            http_options=types.HttpOptions(timeout=int(GEMINI_CALL_TIMEOUT_SEC * 1000)),
+            http_options=_http_options(GEMINI_CALL_TIMEOUT_SEC),
         ),
     )
     elapsed_ms = (time.time() - start) * 1000
@@ -154,8 +127,6 @@ def generate_json(
 
 
 def generate_embedding(text: str, request_id: str = "") -> list[float]:
-    from asset_master_match.core.config import EMBEDDING_DIMENSION, EMBEDDING_MODEL_NAME
-
     model = EMBEDDING_MODEL_NAME
     if model.startswith("models/"):
         model = model[len("models/") :]
@@ -164,7 +135,10 @@ def generate_embedding(text: str, request_id: str = "") -> list[float]:
     result = client.models.embed_content(
         model=model,
         contents=text,
-        config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSION),
+        config=types.EmbedContentConfig(
+            output_dimensionality=EMBEDDING_DIMENSION,
+            http_options=_http_options(EMBED_CALL_TIMEOUT_SEC),
+        ),
     )
     elapsed_ms = (time.time() - start) * 1000
     values = list(result.embeddings[0].values)

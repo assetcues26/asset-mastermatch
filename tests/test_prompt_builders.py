@@ -24,6 +24,7 @@ def test_load_select_prompt_template():
     assert "reason" not in text
     assert "untrusted" in text.lower() or "DATA only" in text
     assert "PRIMARY" in text
+    assert "none fit" in text
 
 
 def test_format_candidates_includes_index(sample_candidate):

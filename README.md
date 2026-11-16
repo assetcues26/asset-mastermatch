@@ -137,7 +137,7 @@ Any other caller fields on the asset object are also echoed (except duplicating 
 
 ### Success (HTTP 200)
 
-Flat `results` in input order. Each row echoes its own `CustomerId` (no top-level `CustomerId`). Nested `master` holds the chosen taxonomy + MakeModel.
+Flat `results` in input order. The body also includes `request_id` (the same id written to the logs). Each row echoes its own `CustomerId` (no top-level `CustomerId`). Nested `master` holds the chosen taxonomy + MakeModel.
 
 ```json
 {
@@ -214,13 +214,14 @@ Flat `results` in input order. Each row echoes its own `CustomerId` (no top-leve
 | `Embedding service unavailable` / `Embedding service error` | Embed upstream failure |
 | `Master data search unavailable` | Pinecone failure |
 | `Gemini selection unavailable` | Gemini select 503 / high demand |
-| `Gemini rate limit hit` | Local or upstream select rate/quota limit |
+| `Gemini rate limit hit` | Upstream select rate or quota limit (429) |
 | `Failed to select master match` | Other Gemini select failures (bad JSON, empty reply, etc.) |
 | `Match pipeline error` | Unexpected worker failure |
+| `Match timed out` | The batch deadline passed before this asset finished |
 
 Exception detail stays in server logs / `func` stderr only (never echoed into `Message`).
 
-Per-item failures set `Error: true` and a `Message`; other assets in the batch still return (HTTP 200 with mixed rows).
+Per-item failures set `Error: true` and a `Message`. `Error`, `Message`, `master`, `MatchFound`, and `MakeModelGenerated` on the input asset are ignored. A batch that still has any row that is not an upstream failure returns HTTP 200. When every row failed because embed, Pinecone, or Gemini failed, or the batch deadline was hit, the status is **503**. Both include `request_id`. A batch of validation errors or genuine no-hit rows stays HTTP 200.
 
 ### Batch validation errors (HTTP 400)
 
@@ -239,14 +240,15 @@ See `local.settings.json.example`. Never commit `local.settings.json`.
 | Key | Role |
 |-----|------|
 | `GEMINI_API_KEY` / `GEMINI_MODEL_NAME` | LLM (swap 3.1 ↔ 2.5 Flash Lite here) |
-| `GEMINI_CALL_TIMEOUT_SEC` / `GEMINI_MAX_RETRIES` | Per-call timeout (default `30`) / retries (default `3`) |
+| `GEMINI_CALL_TIMEOUT_SEC` | Select timeout per attempt (default `30`). Timeouts and 503/504 are retried once, after 1s. 429 is not retried. |
 | `GEMINI_MAX_INPUT_TOKENS` / `GEMINI_MAX_OUTPUT_TOKENS` / `GEMINI_DEFAULT_OUTPUT_TOKENS` | Prompt / generation token caps |
-| `GEMINI_MAX_CALLS_PER_MINUTE` / `_HOUR` / `_DAY` | Local select caps (defaults `120` / `500` / `5000`) |
 | `GEMINI_MAX_PROMPT_CHARS` | Optional override of prompt char budget (else ~4× input tokens) |
 | `EMBEDDING_MODEL_NAME` / `EMBEDDING_DIMENSION` | Embeddings (`1536`) |
+| `EMBED_CALL_TIMEOUT_SEC` | Embed timeout (default `15`). Not retried. |
 | `PINECONE_API_KEY` / `PINECONE_INDEX_NAME` | Vector index |
 | `PINECONE_TOP_K` | Default `5` |
-| `PINECONE_MAX_CALLS_PER_MINUTE` / `_HOUR` / `_DAY` | Local query caps (defaults `100` / `1000` / `10000`) |
+| `PINECONE_CALL_TIMEOUT_SEC` | Query timeout in seconds (default `10`) |
+| `BATCH_DEADLINE_SEC` | Stop the request and return finished rows (default `90`). Unfinished rows get `Match timed out`. `functionTimeout` is 4 minutes so this deadline wins. |
 | `MAX_ASSETS_PER_REQUEST` / `MAX_PARALLEL_ITEMS` | Batch size (50) / parallel workers (10) |
 | `MAX_ASSET_NAME_LENGTH` / `MAX_ASSET_DESCRIPTION_LENGTH` | Input name / optional description caps |
 | `MAX_EMBED_QUERY_LENGTH` | Cap on name(+description) text sent to embed (default `1000`) |
@@ -256,21 +258,17 @@ See `local.settings.json.example`. Never commit `local.settings.json`.
 
 ## Open questions for senior (throughput / production)
 
-Start knobs are set for **50 assets/request** and **10 parallel**. Backend traffic will be continuous — please confirm before raising hour/day or Azure timeouts:
+Start knobs are set for **50 assets/request**, **10 parallel**, and a **90s** batch deadline.
 
 1. Peak HTTP calls/min and assets/min from create-asset?
 2. Usual batch size (1–5 vs often 50)?
-3. Real Gemini RPM/TPM — do local caps (120/min, 500/hr, 5000/day) match the Google project?
-4. Should embeddings count toward Gemini local limits? (Today only select/`generate_json` counts.)
-5. Pinecone: free Starter is OK for parallel 10; when do we need paid (monthly RU / SLA)?
-6. Is `functionTimeout` 2 min enough for worst-case 50 @ parallel 10, or raise / use Premium?
-7. `host.json` `http.maxConcurrentRequests` is 5 — raise if multiple callers?
-8. On rate-limit / stage errors: backend retry+backoff or queue?
-9. Leave hour/day as-is or set from measured peak?
-10. Separate embed / Pinecone / LLM timeouts vs single Gemini timeout?
-11. Separate Pinecone concurrency vs shared `MAX_PARALLEL_ITEMS`?
-12. Prod `GEMINI_MODEL_NAME` (3.1 vs 2.5 flash lite)?
-13. Auth: Anonymous behind gateway vs Function key / APIM?
+3. Real Gemini RPM/TPM for this Google project?
+4. Pinecone: free Starter is OK for parallel 10; when do we need paid (monthly RU / SLA)?
+5. `host.json` `http.maxConcurrentRequests` is 5 — raise if multiple callers?
+6. On rate-limit / stage errors: backend retry+backoff or queue?
+7. Separate Pinecone concurrency vs shared `MAX_PARALLEL_ITEMS`?
+8. Prod `GEMINI_MODEL_NAME` (3.1 vs 2.5 flash lite)?
+9. Auth: Anonymous behind gateway vs Function key / APIM?
 
 ## Docs for agents
 
