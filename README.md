@@ -1,6 +1,17 @@
 # Asset Master Match
 
-Azure Function (Python 3.11) that recommends the best Pinecone master-data entry for asset create, using Gemini for selection and optional MakeModel refinement.
+Azure Function (Python 3.11) that recommends the best Pinecone master-data entry for asset create.
+
+By default it uses Pinecone top-score matching (plus MakeModel fill when needed). Optional Gemini LLM review and wipe-path SubCategory generation are behind env flags (both default **off**):
+
+| Env | Default | Effect when `true` |
+|-----|---------|-------------------|
+| `ENABLE_LLM_REVIEW` | `false` | After score threshold, Gemini picks among all remaining candidates (select call). MakeModel is generated in a separate call only when needed. LLM failure falls back to top-score. Index `0` uses the wipe path. |
+| `ENABLE_SUBCATEGORY_GENERATION` | `false` | On wipe path only, also generate a generic `SubCategory` text (`SubCategoryId` stays null). |
+| `USE_COMBINED_EMBED_QUERY` | `false` | One Pinecone query from `AssetName` + cleaned description (serial/long-digit tokens stripped, then capped). Skips the default name-first 2-step gates. LLM still receives the full original description. |
+| `ENABLE_MATCH_DEBUG_LOG` | `false` | Append local JSONL review records under `debug/match_review.jsonl` (gitignored). Disposable — remove when done reviewing. |
+
+Response includes `SubCategoryGenerated` (`Y`/`N`) alongside `MakeModelGenerated`.
 
 ## Endpoint
 
@@ -198,9 +209,11 @@ Flat `results` in input order. The body also includes `request_id` (the same id 
 | Flag | Meaning |
 |------|---------|
 | `MatchFound: Y` | At least one Pinecone hit; one candidate chosen |
-| `MatchFound: N` | No candidates (or item error); `master` is `null` |
-| `MakeModelGenerated: Y` | MakeModel was refined; `MakeModelId` is `null` |
+| `MatchFound: N` | No acceptable match (or item error). Wipe path may still return a `master` object with generated MakeModel; AssetClass/Category (text and/or ids) are echoed from input when present. |
+| `MakeModelGenerated: Y` | MakeModel was generated; `MakeModelId` is `null` |
 | `MakeModelGenerated: N` | MakeModel taken from Pinecone; id kept |
+| `SubCategoryGenerated: Y` | Wipe path generated SubCategory text; `SubCategoryId` is `null` |
+| `SubCategoryGenerated: N` | SubCategory not generated (from Pinecone or left null) |
 
 `Message` is **fixed text from this service only** (never free-form LLM prose):
 
@@ -255,6 +268,9 @@ See `local.settings.json.example`. Never commit `local.settings.json`.
 | `MAX_MAKE_MODEL_LENGTH` | Generated MakeModel cap (default `150`) |
 | `MAX_PROMPT_FIELD_LENGTH` | Per-field truncate in prompts (default `200`) |
 | `PROMPT_HOT_RELOAD` | Reload prompt markdown without restart (`false` by default) |
+| `USE_COMBINED_EMBED_QUERY` | Optional combined name+cleaned-desc embed (`false` = existing 2-step) |
+| `EMBED_DESCRIPTION_MAX_LENGTH` | Cap on cleaned description chars for combined embed (default `100`) |
+| `ENABLE_MATCH_DEBUG_LOG` | Write local `debug/match_review.jsonl` candidate/LLM review log (`false`) |
 
 ## Open questions for senior (throughput / production)
 

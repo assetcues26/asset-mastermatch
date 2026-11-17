@@ -139,6 +139,35 @@ def test_match_one_no_pinecone_hits(mock_embedding, mock_pinecone, mock_llm):
     assert "No master data" in result["Message"]
 
 
+def test_wipe_echoes_input_asset_class_and_category(
+    mock_embedding, mock_pinecone, mock_llm
+):
+    """Wipe path copies caller's AssetClass/Category into master (text and/or ids)."""
+    mock_embedding()
+    mock_pinecone([])
+    mock_llm({"make_model": "Building works"})
+    result = match_one_asset(
+        {
+            "AssetName": "Building works",
+            "AssetClass": "Leasehold Improvement",
+            "AssetClassId": 1040,
+            "Category": "Land and Building",
+            "CategoryId": 1005,
+        },
+        customer_id=1158,
+        request_id="wipe-echo",
+    )
+    assert result["MatchFound"] == "N"
+    assert result["MakeModelGenerated"] == "Y"
+    assert result["master"]["MakeModel"] == "Building works"
+    assert result["master"]["MakeModelId"] is None
+    assert result["master"]["AssetClass"] == "Leasehold Improvement"
+    assert result["master"]["AssetClassId"] == 1040
+    assert result["master"]["Category"] == "Land and Building"
+    assert result["master"]["CategoryId"] == 1005
+    assert result["master"]["SubCategoryId"] is None
+
+
 def test_match_one_success_no_llm_reason(mock_embedding, mock_pinecone, mock_llm, sample_candidate):
     mock_embedding()
     mock_pinecone([sample_candidate])
@@ -658,3 +687,109 @@ def test_http_200_when_no_candidates(make_http_request, mock_embedding, mock_pin
     assert body["request_id"]
     assert body["results"][0]["Message"] == "No master data candidates found"
     assert "Error" not in body["results"][0]
+
+
+def test_combined_embed_query_strips_serial_from_description_only(
+    mock_pinecone, mock_llm, sample_candidate, monkeypatch
+):
+    monkeypatch.setattr(match_service, "USE_COMBINED_EMBED_QUERY", True)
+    monkeypatch.setattr(match_service, "ENABLE_LLM_REVIEW", False)
+    seen: list[str] = []
+
+    def _embed(text, request_id=""):
+        seen.append(text)
+        return [0.1] * 8
+
+    monkeypatch.setattr(match_service, "generate_embedding", _embed)
+    mock_pinecone([sample_candidate])
+    mock_llm({"candidate_index": 1, "make_model_generated": "N"})
+
+    name = "30 KVA UPS SYSTEM SI.No :HKC101057"
+    desc = "30 KVA UPS SYSTEM SI.No :HKC101057 ,12V 65AH EXIDE POWER SAFE"
+    result = match_one_asset(
+        {"AssetName": name, "AssetDescription": desc},
+        customer_id=1004,
+        request_id="combined-clean",
+    )
+    assert result["MatchFound"] == "Y"
+    assert len(seen) == 1
+    embed_name, embed_desc = seen[0].split("\n", 1)
+    assert embed_name == name
+    assert "EXIDE" in embed_desc
+    assert "12V" in embed_desc
+    assert "65AH" in embed_desc
+    assert "HKC101057" not in embed_desc
+    assert "101057" not in embed_desc
+
+
+def test_combined_embed_keeps_full_description_for_llm(
+    mock_pinecone, sample_candidate, monkeypatch
+):
+    monkeypatch.setattr(match_service, "USE_COMBINED_EMBED_QUERY", True)
+    monkeypatch.setattr(match_service, "ENABLE_LLM_REVIEW", True)
+    seen_embed: list[str] = []
+    prompts: list[str] = []
+
+    def _embed(text, request_id=""):
+        seen_embed.append(text)
+        return [0.1] * 8
+
+    def _json(prompt, request_id=""):
+        prompts.append(prompt)
+        return {
+            "candidate_index": 1,
+            "make_model": sample_candidate["makemodel"],
+            "make_model_generated": "N",
+        }
+
+    monkeypatch.setattr(match_service, "generate_embedding", _embed)
+    monkeypatch.setattr(match_service, "generate_json", _json)
+    mock_pinecone([{**sample_candidate, "score": 0.91}])
+
+    name = "30 KVA UPS SYSTEM SI.No :HKC101057"
+    desc = "30 KVA UPS SYSTEM SI.No :HKC101057 ,12V 65AH EXIDE POWER SAFE"
+    result = match_one_asset(
+        {"AssetName": name, "AssetDescription": desc},
+        customer_id=1004,
+        request_id="combined-llm-full-desc",
+    )
+    assert result["MatchFound"] == "Y"
+    assert len(seen_embed) == 1
+    assert "HKC101057" not in seen_embed[0].split("\n", 1)[1]
+    assert prompts and "HKC101057" in prompts[0]
+    assert "EXIDE POWER SAFE" in prompts[0]
+
+
+def test_match_debug_log_writes_when_enabled(
+    mock_embedding, mock_pinecone, mock_llm, sample_candidate, monkeypatch, tmp_path
+):
+    log_file = tmp_path / "match_review.jsonl"
+    monkeypatch.setattr(match_service, "ENABLE_MATCH_DEBUG_LOG", True)
+    monkeypatch.setattr(match_service, "ENABLE_LLM_REVIEW", False)
+    monkeypatch.setattr(
+        "asset_master_match.utils.debug_match_log.ENABLE_MATCH_DEBUG_LOG",
+        True,
+    )
+    monkeypatch.setattr(
+        "asset_master_match.utils.debug_match_log._LOG_DIR",
+        tmp_path,
+    )
+    monkeypatch.setattr(
+        "asset_master_match.utils.debug_match_log._LOG_FILE",
+        log_file,
+    )
+    mock_embedding()
+    mock_pinecone([sample_candidate])
+    mock_llm({"candidate_index": 1, "make_model_generated": "N"})
+    result = match_one_asset(
+        {"AssetName": "hdd 16 gb ram", "AssetDescription": "DDR4 module"},
+        customer_id=1004,
+        request_id="debug-log",
+    )
+    assert result["MatchFound"] == "Y"
+    assert log_file.exists()
+    line = json.loads(log_file.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert line["AssetName"] == "hdd 16 gb ram"
+    assert line["search_mode"] == "two_step"
+    assert "candidates_merged" in line
+    assert line["final"]["MatchFound"] == "Y"

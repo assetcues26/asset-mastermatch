@@ -43,6 +43,11 @@ build/
 # Local agent notes (not for remote / deploy)
 cursor.md
 
+# Local match review logs (ENABLE_MATCH_DEBUG_LOG) — never commit
+debug/
+*_match_review*.json
+*_match_review*.jsonl
+
 # IDE
 .vscode/
 .idea/

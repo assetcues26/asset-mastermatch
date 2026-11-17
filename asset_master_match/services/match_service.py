@@ -14,25 +14,38 @@ import azure.functions as func
 
 from asset_master_match.core.config import (
     BATCH_DEADLINE_SEC,
+    EMBED_DESCRIPTION_MAX_LENGTH,
+    ENABLE_LLM_REVIEW,
+    ENABLE_MATCH_DEBUG_LOG,
+    ENABLE_SUBCATEGORY_GENERATION,
     MAX_ASSET_DESCRIPTION_LENGTH,
     MAX_ASSET_NAME_LENGTH,
     MAX_ASSETS_PER_REQUEST,
     MAX_EMBED_QUERY_LENGTH,
     MAX_MAKE_MODEL_LENGTH,
     MAX_PARALLEL_ITEMS,
+    MAX_PROMPT_FIELD_LENGTH,
     MIN_MATCH_SCORE,
     PINECONE_TOP_K,
+    USE_COMBINED_EMBED_QUERY,
+)
+from asset_master_match.prompts.builders import (
+    build_select_candidate_prompt,
+    build_subcategory_prompt,
 )
 from asset_master_match.services.gemini_service import (
     generate_embedding,
     generate_json,
 )
 from asset_master_match.services.pinecone_service import query_masterdata
+from asset_master_match.utils.debug_match_log import maybe_log_match
 from asset_master_match.utils.helpers import (
     build_embed_query,
+    clean_description_for_embed,
     normalize_text,
     safe_str,
     sanitize_make_model,
+    sanitize_prompt_field,
     texts_match,
     to_int_or_none,
 )
@@ -75,6 +88,7 @@ _RESERVED_RESULT_KEYS = frozenset(
         "master",
         "MatchFound",
         "MakeModelGenerated",
+        "SubCategoryGenerated",
         "Message",
         "Error",
     }
@@ -279,6 +293,7 @@ def _no_match_result(echoed: dict[str, Any], message: str) -> dict[str, Any]:
         "master": None,
         "MatchFound": "N",
         "MakeModelGenerated": "N",
+        "SubCategoryGenerated": "N",
         "Message": message,
     }
 
@@ -301,20 +316,38 @@ def _generated_without_master(
         _log_stage_failure(request_id, "select", exc)
     if _is_placeholder_make_model(proposed):
         proposed = sanitize_make_model(asset_name, MAX_MAKE_MODEL_LENGTH)
+
+    sub_category = None
+    sub_generated = "N"
+    if ENABLE_SUBCATEGORY_GENERATION and not _deadline_hit(deadline):
+        try:
+            sub_category = _generate_subcategory_text(
+                asset_name, asset_description, request_id
+            )
+        except Exception as exc:
+            _log_stage_failure(request_id, "subcategory", exc)
+        if sub_category:
+            sub_generated = "Y"
+        else:
+            sub_category = None
+
+    # Echo caller's AssetClass/Category into master when present (text and/or ids).
+    # Do not invent values — only copy what the input already had.
     return {
         **echoed,
         "master": {
-            "AssetClass": None,
-            "AssetClassId": None,
-            "Category": None,
-            "CategoryId": None,
-            "SubCategory": None,
+            "AssetClass": safe_str(echoed.get("AssetClass")),
+            "AssetClassId": to_int_or_none(echoed.get("AssetClassId")),
+            "Category": safe_str(echoed.get("Category")),
+            "CategoryId": to_int_or_none(echoed.get("CategoryId")),
+            "SubCategory": sub_category,
             "SubCategoryId": None,
             "MakeModel": proposed,
             "MakeModelId": None,
         },
         "MatchFound": "N",
         "MakeModelGenerated": "Y",
+        "SubCategoryGenerated": sub_generated,
         "Message": message,
     }
 
@@ -325,6 +358,7 @@ def _error_result(echoed: dict[str, Any], message: str) -> dict[str, Any]:
         "master": None,
         "MatchFound": "N",
         "MakeModelGenerated": "N",
+        "SubCategoryGenerated": "N",
         "Message": message,
         "Error": True,
     }
@@ -465,6 +499,222 @@ def _generate_make_model_text(asset_name: str, asset_description: str, request_i
     return safe_str(data.get("make_model")) or ""
 
 
+def _generate_subcategory_text(
+    asset_name: str, asset_description: str, request_id: str
+) -> str:
+    """Wipe-path only: short generic SubCategory text. Never invents ids."""
+    prompt = build_subcategory_prompt(asset_name, asset_description)
+    data = generate_json(prompt, request_id=request_id)
+    return sanitize_prompt_field(
+        data.get("sub_category"), MAX_PROMPT_FIELD_LENGTH
+    )
+
+
+def _candidates_above_threshold(
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in candidates
+        if (score := _score(row)) is not None and score >= MIN_MATCH_SCORE
+    ]
+
+
+def _complete_match_from_candidate(
+    echoed: dict[str, Any],
+    chosen: dict[str, Any],
+    asset_name: str,
+    asset_description: str,
+    request_id: str,
+    deadline: float | None,
+    *,
+    force_generate_make_model: bool = False,
+) -> dict[str, Any]:
+    """Keep taxonomy from chosen row; generate MakeModel only when needed."""
+    stored = safe_str(chosen.get("makemodel")) or ""
+    need_generate = force_generate_make_model or _is_placeholder_make_model(stored)
+    if not need_generate:
+        return {
+            **echoed,
+            "master": _master_from_candidate(
+                chosen, make_model=stored, make_model_generated="N"
+            ),
+            "MatchFound": "Y",
+            "MakeModelGenerated": "N",
+            "SubCategoryGenerated": "N",
+            "Message": None,
+        }
+
+    if _deadline_hit(deadline):
+        return _error_result(echoed, MSG_TIMED_OUT)
+    try:
+        proposed = _generate_make_model_text(
+            asset_name, asset_description, request_id
+        )
+    except Exception as exc:
+        _log_stage_failure(request_id, "select", exc)
+        return _error_result(echoed, _message_for_select_exc(exc))
+    if _is_placeholder_make_model(proposed):
+        proposed = sanitize_make_model(asset_name, MAX_MAKE_MODEL_LENGTH)
+    return {
+        **echoed,
+        "master": _master_from_candidate(
+            chosen, make_model=proposed, make_model_generated="Y"
+        ),
+        "MatchFound": "Y",
+        "MakeModelGenerated": "Y",
+        "SubCategoryGenerated": "N",
+        "Message": None,
+    }
+
+
+def _candidate_debug_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compact candidate rows for local review logs only."""
+    out: list[dict[str, Any]] = []
+    for rank, row in enumerate(rows, start=1):
+        out.append(
+            {
+                "rank": rank,
+                "score": _score(row),
+                "makemodel": safe_str(row.get("makemodel")),
+                "makemodelid": to_int_or_none(row.get("makemodelid")),
+                "assetclass": safe_str(row.get("assetclass")),
+                "category": safe_str(
+                    row.get("category") or row.get("categoryname")
+                ),
+                "subcategory": safe_str(row.get("subcategory")),
+                "_id": safe_str(row.get("_id")),
+            }
+        )
+    return out
+
+
+def _finish_with_debug(
+    result: dict[str, Any],
+    debug: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if debug is not None:
+        master = result.get("master") if isinstance(result.get("master"), dict) else None
+        debug["final"] = {
+            "MatchFound": result.get("MatchFound"),
+            "MakeModelGenerated": result.get("MakeModelGenerated"),
+            "SubCategoryGenerated": result.get("SubCategoryGenerated"),
+            "Message": result.get("Message"),
+            "Error": result.get("Error"),
+            "MakeModel": None if master is None else master.get("MakeModel"),
+            "MakeModelId": None if master is None else master.get("MakeModelId"),
+        }
+        maybe_log_match(debug)
+    return result
+
+
+def _llm_review_match(
+    echoed: dict[str, Any],
+    asset_name: str,
+    asset_description: str,
+    candidates: list[dict[str, Any]],
+    request_id: str,
+    deadline: float | None,
+    debug: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """LLM picks among above-threshold candidates; falls back to top-score on failure."""
+    eligible = _candidates_above_threshold(candidates)
+    if debug is not None:
+        debug["eligible_for_llm"] = _candidate_debug_rows(eligible)
+    if not eligible:
+        if debug is not None:
+            debug["decision_path"] = "llm_review→no_eligible"
+        return _generated_without_master(
+            echoed,
+            asset_name,
+            asset_description,
+            request_id,
+            MSG_NO_ACCEPTABLE_MATCH,
+            deadline,
+        )
+
+    llm: dict[str, Any] | None = None
+    try:
+        if _deadline_hit(deadline):
+            if debug is not None:
+                debug["decision_path"] = "llm_review→timed_out"
+            return _error_result(echoed, MSG_TIMED_OUT)
+        prompt = build_select_candidate_prompt(
+            asset_name, eligible, asset_description
+        )
+        llm = generate_json(prompt, request_id=request_id)
+    except Exception as exc:
+        _log_stage_failure(request_id, "llm-review", exc)
+        logging.warning(
+            "[%s] LLM review failed; falling back to top-score match",
+            request_id,
+        )
+        if debug is not None:
+            debug["llm_fallback"] = "top_score"
+            debug["decision_path"] = "llm_review→fallback_top_score"
+        return _complete_match_from_candidate(
+            echoed,
+            _stable_master(eligible),
+            asset_name,
+            asset_description,
+            request_id,
+            deadline,
+        )
+
+    if debug is not None:
+        debug["llm_raw"] = {
+            "candidate_index": (llm or {}).get("candidate_index"),
+            "make_model": (llm or {}).get("make_model"),
+            "make_model_generated": (llm or {}).get("make_model_generated"),
+        }
+
+    index = to_int_or_none((llm or {}).get("candidate_index"))
+    if index == 0:
+        if debug is not None:
+            debug["decision_path"] = "llm_review→index_0_wipe"
+        return _generated_without_master(
+            echoed,
+            asset_name,
+            asset_description,
+            request_id,
+            MSG_NO_ACCEPTABLE_MATCH,
+            deadline,
+        )
+    if index is None or index < 1 or index > len(eligible):
+        logging.warning(
+            "[%s] LLM review returned invalid index %s; falling back to top-score",
+            request_id,
+            index,
+        )
+        if debug is not None:
+            debug["llm_fallback"] = "top_score_invalid_index"
+            debug["decision_path"] = "llm_review→fallback_invalid_index"
+        return _complete_match_from_candidate(
+            echoed,
+            _stable_master(eligible),
+            asset_name,
+            asset_description,
+            request_id,
+            deadline,
+        )
+
+    chosen = eligible[index - 1]
+    if debug is not None:
+        debug["llm_chosen"] = _candidate_debug_rows([chosen])[0]
+        debug["decision_path"] = "llm_review→pick"
+    flag_raw = str((llm or {}).get("make_model_generated") or "N").strip().upper()
+    force_generate = flag_raw == "Y"
+    return _complete_match_from_candidate(
+        echoed,
+        chosen,
+        asset_name,
+        asset_description,
+        request_id,
+        deadline,
+        force_generate_make_model=force_generate,
+    )
+
+
 def _deadline_hit(deadline: float | None) -> bool:
     return deadline is not None and time.monotonic() >= deadline
 
@@ -492,113 +742,232 @@ def match_one_asset(
     category_id = to_int_or_none(asset.get("CategoryId"))
     asset_class_id = to_int_or_none(asset.get("AssetClassId"))
     item_id = f"{request_id}:{asset_name[:40]}"
-
-    if _deadline_hit(deadline):
-        return _error_result(echoed, MSG_TIMED_OUT)
-    try:
-        name_embedding = generate_embedding(asset_name, request_id=item_id)
-    except Exception as exc:
-        _log_stage_failure(item_id, "embed", exc)
-        return _error_result(echoed, _message_for_embed_exc(exc))
-    if not name_embedding:
-        return _error_result(echoed, MSG_EMBED_FAILED)
-
-    if _deadline_hit(deadline):
-        return _error_result(echoed, MSG_TIMED_OUT)
-    try:
-        candidates = query_masterdata(
-            name_embedding,
-            customer_id=customer_id,
-            category_id=category_id,
-            asset_class_id=asset_class_id,
-            request_id=item_id,
-        )
-        # A short product description can name the real master when the asset
-        # name is only a size. Invoice text is left out so it cannot pull a
-        # different product into the top hits.
-        desc_useful = (
-            bool(asset_description)
-            and asset_description.casefold() != asset_name.casefold()
-            and len(asset_description) <= 80
-            and not _looks_like_invoice(asset_description)
-            and (_best_score(candidates) or 0) < 0.75
-        )
-        if desc_useful and not _deadline_hit(deadline):
-            try:
-                query_text = build_embed_query(
-                    asset_name,
-                    asset_description,
-                    max_description_length=MAX_ASSET_DESCRIPTION_LENGTH,
-                    max_embed_query_length=MAX_EMBED_QUERY_LENGTH,
-                )
-                desc_embedding = generate_embedding(query_text, request_id=item_id)
-                if desc_embedding:
-                    described = query_masterdata(
-                        desc_embedding,
-                        customer_id=customer_id,
-                        category_id=category_id,
-                        asset_class_id=asset_class_id,
-                        request_id=item_id,
-                    )
-                    candidates = _merge_candidates(candidates, described)
-            except Exception as exc:
-                _log_stage_failure(item_id, "description-search", exc)
-    except Exception as exc:
-        _log_stage_failure(item_id, "pinecone", exc)
-        return _error_result(echoed, MSG_PINECONE_UNAVAILABLE)
-    if not candidates:
-        return _generated_without_master(
-            echoed,
-            asset_name,
-            asset_description,
-            item_id,
-            MSG_NO_CANDIDATES,
-            deadline,
-        )
-    best = _best_score(candidates)
-    if best is not None and best < MIN_MATCH_SCORE:
-        return _generated_without_master(
-            echoed,
-            asset_name,
-            asset_description,
-            item_id,
-            MSG_NO_ACCEPTABLE_MATCH,
-            deadline,
-        )
-
-    chosen = _stable_master(candidates)
-    stored = safe_str(chosen.get("makemodel")) or ""
-    if not _is_placeholder_make_model(stored):
-        return {
-            **echoed,
-            "master": _master_from_candidate(
-                chosen, make_model=stored, make_model_generated="N"
+    debug: dict[str, Any] | None = None
+    if ENABLE_MATCH_DEBUG_LOG:
+        debug = {
+            "item_id": item_id,
+            "CustomerId": customer_id,
+            "CategoryId": category_id,
+            "AssetClassId": asset_class_id,
+            "AssetName": asset_name,
+            "AssetDescription_raw": asset_description or None,
+            "search_mode": (
+                "combined" if USE_COMBINED_EMBED_QUERY else "two_step"
             ),
-            "MatchFound": "Y",
-            "MakeModelGenerated": "N",
-            "Message": None,
+            "USE_COMBINED_EMBED_QUERY": USE_COMBINED_EMBED_QUERY,
+            "ENABLE_LLM_REVIEW": ENABLE_LLM_REVIEW,
+            "embed_queries": [],
         }
 
     if _deadline_hit(deadline):
-        return _error_result(echoed, MSG_TIMED_OUT)
-    try:
-        proposed = _generate_make_model_text(
-            asset_name, asset_description, item_id
+        return _finish_with_debug(_error_result(echoed, MSG_TIMED_OUT), debug)
+
+    candidates: list[dict[str, Any]] = []
+    if USE_COMBINED_EMBED_QUERY:
+        # Optional path: one embed of name + cleaned/truncated description.
+        cleaned_desc = clean_description_for_embed(
+            asset_description,
+            max_length=EMBED_DESCRIPTION_MAX_LENGTH,
         )
-    except Exception as exc:
-        _log_stage_failure(item_id, "select", exc)
-        return _error_result(echoed, _message_for_select_exc(exc))
-    if _is_placeholder_make_model(proposed):
-        proposed = sanitize_make_model(asset_name, MAX_MAKE_MODEL_LENGTH)
-    return {
-        **echoed,
-        "master": _master_from_candidate(
-            chosen, make_model=proposed, make_model_generated="Y"
+        query_text = build_embed_query(
+            asset_name,
+            cleaned_desc or None,
+            max_description_length=EMBED_DESCRIPTION_MAX_LENGTH,
+            max_embed_query_length=MAX_EMBED_QUERY_LENGTH,
+        )
+        if debug is not None:
+            debug["AssetDescription_cleaned"] = cleaned_desc or None
+            debug["AssetDescription_for_embed"] = cleaned_desc or None
+            debug["embed_queries"].append(
+                {"stage": "combined", "text": query_text}
+            )
+        try:
+            embedding = generate_embedding(query_text, request_id=item_id)
+        except Exception as exc:
+            _log_stage_failure(item_id, "embed", exc)
+            return _finish_with_debug(
+                _error_result(echoed, _message_for_embed_exc(exc)), debug
+            )
+        if not embedding:
+            return _finish_with_debug(
+                _error_result(echoed, MSG_EMBED_FAILED), debug
+            )
+        if _deadline_hit(deadline):
+            return _finish_with_debug(
+                _error_result(echoed, MSG_TIMED_OUT), debug
+            )
+        try:
+            candidates = query_masterdata(
+                embedding,
+                customer_id=customer_id,
+                category_id=category_id,
+                asset_class_id=asset_class_id,
+                request_id=item_id,
+            )
+        except Exception as exc:
+            _log_stage_failure(item_id, "pinecone", exc)
+            return _finish_with_debug(
+                _error_result(echoed, MSG_PINECONE_UNAVAILABLE), debug
+            )
+    else:
+        # Default: name-first embed, optional second query with raw description.
+        try:
+            name_embedding = generate_embedding(asset_name, request_id=item_id)
+        except Exception as exc:
+            _log_stage_failure(item_id, "embed", exc)
+            return _finish_with_debug(
+                _error_result(echoed, _message_for_embed_exc(exc)), debug
+            )
+        if not name_embedding:
+            return _finish_with_debug(
+                _error_result(echoed, MSG_EMBED_FAILED), debug
+            )
+        if debug is not None:
+            debug["embed_queries"].append({"stage": "name", "text": asset_name})
+
+        if _deadline_hit(deadline):
+            return _finish_with_debug(
+                _error_result(echoed, MSG_TIMED_OUT), debug
+            )
+        try:
+            candidates = query_masterdata(
+                name_embedding,
+                customer_id=customer_id,
+                category_id=category_id,
+                asset_class_id=asset_class_id,
+                request_id=item_id,
+            )
+            if debug is not None:
+                debug["pinecone_name_hits"] = _candidate_debug_rows(candidates)
+                debug["best_score_name"] = _best_score(candidates)
+            # A short product description can name the real master when the asset
+            # name is only a size. Invoice text is left out so it cannot pull a
+            # different product into the top hits.
+            desc_useful = (
+                bool(asset_description)
+                and asset_description.casefold() != asset_name.casefold()
+                and len(asset_description) <= 80
+                and not _looks_like_invoice(asset_description)
+                and (_best_score(candidates) or 0) < 0.75
+            )
+            if debug is not None:
+                debug["desc_search_ran"] = False
+                if not asset_description:
+                    debug["desc_skip_reason"] = "no_desc"
+                elif asset_description.casefold() == asset_name.casefold():
+                    debug["desc_skip_reason"] = "desc_same_as_name"
+                elif len(asset_description) > 80:
+                    debug["desc_skip_reason"] = "desc_too_long"
+                elif _looks_like_invoice(asset_description):
+                    debug["desc_skip_reason"] = "invoice_heuristic"
+                elif (_best_score(candidates) or 0) >= 0.75:
+                    debug["desc_skip_reason"] = "strong_name_score"
+                else:
+                    debug["desc_skip_reason"] = None
+            if desc_useful and not _deadline_hit(deadline):
+                try:
+                    query_text = build_embed_query(
+                        asset_name,
+                        asset_description,
+                        max_description_length=MAX_ASSET_DESCRIPTION_LENGTH,
+                        max_embed_query_length=MAX_EMBED_QUERY_LENGTH,
+                    )
+                    if debug is not None:
+                        debug["embed_queries"].append(
+                            {"stage": "name_plus_desc", "text": query_text}
+                        )
+                    desc_embedding = generate_embedding(
+                        query_text, request_id=item_id
+                    )
+                    if desc_embedding:
+                        described = query_masterdata(
+                            desc_embedding,
+                            customer_id=customer_id,
+                            category_id=category_id,
+                            asset_class_id=asset_class_id,
+                            request_id=item_id,
+                        )
+                        if debug is not None:
+                            debug["desc_search_ran"] = True
+                            debug["desc_skip_reason"] = None
+                            debug["pinecone_desc_hits"] = _candidate_debug_rows(
+                                described
+                            )
+                        candidates = _merge_candidates(candidates, described)
+                except Exception as exc:
+                    _log_stage_failure(item_id, "description-search", exc)
+        except Exception as exc:
+            _log_stage_failure(item_id, "pinecone", exc)
+            return _finish_with_debug(
+                _error_result(echoed, MSG_PINECONE_UNAVAILABLE), debug
+            )
+
+    if debug is not None:
+        debug["candidates_merged"] = _candidate_debug_rows(candidates)
+        debug["best_score_final"] = _best_score(candidates)
+
+    if not candidates:
+        if debug is not None:
+            debug["decision_path"] = "no_candidates"
+        return _finish_with_debug(
+            _generated_without_master(
+                echoed,
+                asset_name,
+                asset_description,
+                item_id,
+                MSG_NO_CANDIDATES,
+                deadline,
+            ),
+            debug,
+        )
+    best = _best_score(candidates)
+    if best is not None and best < MIN_MATCH_SCORE:
+        if debug is not None:
+            debug["decision_path"] = "below_threshold"
+        return _finish_with_debug(
+            _generated_without_master(
+                echoed,
+                asset_name,
+                asset_description,
+                item_id,
+                MSG_NO_ACCEPTABLE_MATCH,
+                deadline,
+            ),
+            debug,
+        )
+
+    # Optional enhancement: LLM reviews all above-threshold candidates.
+    # Default OFF keeps the existing top-score path below.
+    # LLM still receives the full original AssetDescription (unchanged).
+    if ENABLE_LLM_REVIEW:
+        return _finish_with_debug(
+            _llm_review_match(
+                echoed,
+                asset_name,
+                asset_description,
+                candidates,
+                item_id,
+                deadline,
+                debug=debug,
+            ),
+            debug,
+        )
+
+    chosen = _stable_master(candidates)
+    if debug is not None:
+        debug["decision_path"] = "top_score"
+        debug["top_score_chosen"] = _candidate_debug_rows([chosen])[0]
+    return _finish_with_debug(
+        _complete_match_from_candidate(
+            echoed,
+            chosen,
+            asset_name,
+            asset_description,
+            item_id,
+            deadline,
         ),
-        "MatchFound": "Y",
-        "MakeModelGenerated": "Y",
-        "Message": None,
-    }
+        debug,
+    )
 
 
 def _parse_body(req: func.HttpRequest) -> dict[str, Any]:

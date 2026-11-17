@@ -45,3 +45,7 @@ build/
 # Local match console. Never publish this with the function app.
 frontend/
 frontend/**
+
+debug/
+*_match_review*.json
+*_match_review*.jsonl

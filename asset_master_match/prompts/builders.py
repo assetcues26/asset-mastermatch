@@ -47,3 +47,30 @@ def build_select_prompt(
         asset_description=desc or "(none)",
         candidate_summary=format_candidates_for_prompt(candidates),
     )
+
+
+def build_select_candidate_prompt(
+    asset_name: str,
+    candidates: list[dict[str, Any]],
+    asset_description: str = "",
+) -> str:
+    """Select-only prompt: candidate index + whether MakeModel should be generated."""
+    desc = _field(asset_description, MAX_PROMPT_FIELD_LENGTH)
+    return load_prompt(
+        "select_candidate.md",
+        asset_name=_field(asset_name, MAX_ASSET_NAME_LENGTH) or "(empty)",
+        asset_description=desc or "(none)",
+        candidate_summary=format_candidates_for_prompt(candidates),
+    )
+
+
+def build_subcategory_prompt(
+    asset_name: str,
+    asset_description: str = "",
+) -> str:
+    desc = _field(asset_description, MAX_PROMPT_FIELD_LENGTH)
+    return load_prompt(
+        "recommend_subcategory.md",
+        asset_name=_field(asset_name, MAX_ASSET_NAME_LENGTH) or "(empty)",
+        asset_description=desc or "(none)",
+    )

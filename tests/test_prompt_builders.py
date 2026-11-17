@@ -1,6 +1,11 @@
 """Tests for prompt builders / loader."""
 
-from asset_master_match.prompts.builders import build_select_prompt, format_candidates_for_prompt
+from asset_master_match.prompts.builders import (
+    build_select_candidate_prompt,
+    build_select_prompt,
+    build_subcategory_prompt,
+    format_candidates_for_prompt,
+)
 from asset_master_match.prompts.loader import load_prompt
 
 
@@ -61,3 +66,26 @@ def test_format_candidates_caps_long_fields(sample_candidate):
     summary = format_candidates_for_prompt([row])
     assert "M" * 200 in summary
     assert "M" * 201 not in summary
+
+
+def test_build_select_candidate_prompt(sample_candidate):
+    prompt = build_select_candidate_prompt(
+        "Dining Table 900x900x750",
+        [sample_candidate],
+        asset_description="Dining Table, White table top",
+    )
+    assert "Dining Table 900x900x750" in prompt
+    assert "CandidateIndex=1" in prompt
+    assert "make_model_generated" in prompt
+    assert "candidate_index" in prompt
+    assert "Do NOT write MakeModel text" in prompt or "do NOT write MakeModel" in prompt
+
+
+def test_build_subcategory_prompt():
+    prompt = build_subcategory_prompt(
+        "Building works",
+        asset_description="Leasehold Improvement",
+    )
+    assert "Building works" in prompt
+    assert "Leasehold Improvement" in prompt
+    assert "sub_category" in prompt

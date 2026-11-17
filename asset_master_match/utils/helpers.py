@@ -6,6 +6,8 @@ import re
 from typing import Any
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Tokens that contain a run of 6+ digits (serials / invoice ids), not short specs like 12V / 65AH.
+_LONG_DIGIT_TOKEN = re.compile(r"\S*\d{6,}\S*")
 
 
 def to_int_or_none(value: Any) -> int | None:
@@ -52,6 +54,26 @@ def sanitize_prompt_field(value: Any, max_length: int) -> str:
 def sanitize_make_model(value: Any, max_length: int) -> str:
     """Sanitize LLM-proposed MakeModel text before returning to callers."""
     return sanitize_prompt_field(value, max_length)
+
+
+def clean_description_for_embed(
+    description: Any,
+    *,
+    max_length: int = 100,
+) -> str:
+    """Clean AssetDescription for Pinecone embed only (not for LLM prompts).
+
+    Order: normalize → strip serial/long-digit tokens → collapse whitespace →
+    truncate to ``max_length``. Keeps short measurement numbers (12V, 65AH, 30).
+    """
+    text = normalize_text(description)
+    if not text:
+        return ""
+    text = _LONG_DIGIT_TOKEN.sub(" ", text)
+    text = normalize_text(text)
+    if max_length > 0 and len(text) > max_length:
+        text = text[:max_length].rstrip()
+    return text
 
 
 def build_embed_query(

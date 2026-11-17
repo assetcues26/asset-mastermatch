@@ -2,6 +2,7 @@
 
 from asset_master_match.utils.helpers import (
     build_embed_query,
+    clean_description_for_embed,
     normalize_text,
     safe_str,
     sanitize_make_model,
@@ -45,6 +46,35 @@ def test_sanitize_prompt_field_strips_and_truncates():
 def test_sanitize_make_model():
     assert sanitize_make_model("  Dell XPS  ", 20) == "Dell XPS"
     assert len(sanitize_make_model("x" * 200, 50)) == 50
+
+
+def test_clean_description_strips_serial_keeps_specs():
+    raw = (
+        "30 KVA UPS SYSTEM SI.No :HKC101057 ,12V 65AH EXIDE POWER SAFE"
+    )
+    cleaned = clean_description_for_embed(raw, max_length=100)
+    assert "EXIDE" in cleaned
+    assert "12V" in cleaned
+    assert "65AH" in cleaned
+    assert "30" in cleaned
+    assert "101057" not in cleaned
+    assert "HKC101057" not in cleaned
+
+
+def test_clean_description_strips_then_truncates():
+    # Clean before truncate: stripping the serial frees room so EXIDE still fits.
+    # Truncate-first would cut the brand off with this layout.
+    raw = ("X" * 90) + " HKC999999 EXIDE"
+    cleaned = clean_description_for_embed(raw, max_length=100)
+    assert "999999" not in cleaned
+    assert "HKC999999" not in cleaned
+    assert len(cleaned) <= 100
+    assert "EXIDE" in cleaned
+
+
+def test_clean_description_empty():
+    assert clean_description_for_embed("") == ""
+    assert clean_description_for_embed(None) == ""
 
 
 def test_build_embed_query_name_only_when_no_description():

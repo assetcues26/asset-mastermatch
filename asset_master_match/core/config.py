@@ -66,6 +66,16 @@ MAX_PROMPT_FIELD_LENGTH = _env_int("MAX_PROMPT_FIELD_LENGTH", 200)
 # Prompts
 PROMPT_HOT_RELOAD = _env_bool("PROMPT_HOT_RELOAD", False)
 
+# Optional enhancements (default OFF = current top-score path unchanged)
+ENABLE_LLM_REVIEW = _env_bool("ENABLE_LLM_REVIEW", False)
+ENABLE_SUBCATEGORY_GENERATION = _env_bool("ENABLE_SUBCATEGORY_GENERATION", False)
+# When true: one embed of AssetName + cleaned/truncated description (skip 2-step gates).
+USE_COMBINED_EMBED_QUERY = _env_bool("USE_COMBINED_EMBED_QUERY", False)
+# Max chars of cleaned description appended for combined embed (clean first, then truncate).
+EMBED_DESCRIPTION_MAX_LENGTH = _env_int("EMBED_DESCRIPTION_MAX_LENGTH", 100)
+# Local-only JSONL review log (gitignored). Safe to delete the logger module later.
+ENABLE_MATCH_DEBUG_LOG = _env_bool("ENABLE_MATCH_DEBUG_LOG", False)
+
 
 def clamp_output_tokens(requested: int | None = None) -> int:
     value = requested if requested is not None else GEMINI_DEFAULT_OUTPUT_TOKENS
