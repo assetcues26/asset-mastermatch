@@ -166,8 +166,6 @@ def test_wipe_echoes_input_asset_class_and_category(
     assert result["master"]["Category"] == "Land and Building"
     assert result["master"]["CategoryId"] == 1005
     assert result["master"]["SubCategoryId"] is None
-    assert result["master"]["Model"] is None
-    assert result["master"]["ModelId"] is None
 
 
 def test_match_one_success_no_llm_reason(mock_embedding, mock_pinecone, mock_llm, sample_candidate):
@@ -197,44 +195,8 @@ def test_match_one_success_no_llm_reason(mock_embedding, mock_pinecone, mock_llm
     assert result["Cost"] == 50000
     assert result["master"]["MakeModel"] == "8 gb ram"
     assert result["master"]["MakeModelId"] == 10338
-    assert result["master"]["Model"] is None
-    assert result["master"]["ModelId"] is None
     assert result["master"]["CategoryId"] == 1039
     assert result["Message"] is None
-
-
-def test_match_one_returns_model_fields(mock_embedding, mock_pinecone, sample_candidate):
-    mock_embedding()
-    mock_pinecone(
-        [
-            {
-                **sample_candidate,
-                "_id": "1151",
-                "makemodel": "Asus",
-                "makemodelid": 98655,
-                "model": "test1",
-                "modelid": 1151,
-                "assetclass": "TEBFGS",
-                "assetclassid": 4947,
-                "category": "IT_ASSET.",
-                "categoryid": 1007,
-                "subcategory": "Laptop",
-                "subcategoryid": 1024,
-            }
-        ]
-    )
-    result = match_one_asset(
-        {"AssetName": "Asus test1 laptop"},
-        customer_id=1001,
-        request_id="model-1",
-    )
-    assert result["MatchFound"] == "Y"
-    assert result["master"]["MakeModel"] == "Asus"
-    assert result["master"]["MakeModelId"] == 98655
-    assert result["master"]["Model"] == "test1"
-    assert result["master"]["ModelId"] == 1151
-    assert result["master"]["SubCategory"] == "Laptop"
-    assert result["master"]["SubCategoryId"] == 1024
 
 
 def test_match_one_embeds_name_plus_description(

@@ -28,8 +28,6 @@ def format_candidates_for_prompt(candidates: list[dict[str, Any]]) -> str:
                     f"SubCategoryId={to_int_or_none(row.get('subcategoryid'))}",
                     f"MakeModel={_field(row.get('makemodel'))}",
                     f"MakeModelId={to_int_or_none(row.get('makemodelid'))}",
-                    f"Model={_field(row.get('model'))}",
-                    f"ModelId={to_int_or_none(row.get('modelid'))}",
                     f"Score={row.get('score')}",
                 ]
             )
