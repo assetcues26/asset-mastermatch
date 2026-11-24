@@ -171,7 +171,9 @@ Flat `results` in input order. The body also includes `request_id` (the same id 
         "SubCategory": "Almirah",
         "SubCategoryId": 83195,
         "MakeModel": "Metal Almirah",
-        "MakeModelId": 153356
+        "MakeModelId": 153356,
+        "Model": null,
+        "ModelId": null
       },
       "MatchFound": "Y",
       "MakeModelGenerated": "N",
@@ -196,7 +198,9 @@ Flat `results` in input order. The body also includes `request_id` (the same id 
         "SubCategory": "Cassette AC",
         "SubCategoryId": 83160,
         "MakeModel": "Voltas 2.0 Ton Inverter Cassette AC",
-        "MakeModelId": null
+        "MakeModelId": null,
+        "Model": null,
+        "ModelId": null
       },
       "MatchFound": "Y",
       "MakeModelGenerated": "Y",
@@ -212,6 +216,7 @@ Flat `results` in input order. The body also includes `request_id` (the same id 
 | `MatchFound: N` | No acceptable match (or item error). Wipe path may still return a `master` object with generated MakeModel; AssetClass/Category (text and/or ids) are echoed from input when present. |
 | `MakeModelGenerated: Y` | MakeModel was generated; `MakeModelId` is `null` |
 | `MakeModelGenerated: N` | MakeModel taken from Pinecone; id kept |
+| `Model` / `ModelId` | Product model from Pinecone `model` / `modelid`. Null when that row has no model, and on the wipe path (no master row). Kept even when MakeModel text is generated. |
 | `SubCategoryGenerated: Y` | Wipe path generated SubCategory text; `SubCategoryId` is `null` |
 | `SubCategoryGenerated: N` | SubCategory not generated (from Pinecone or left null) |
 

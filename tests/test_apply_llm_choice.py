@@ -12,8 +12,35 @@ def test_master_keeps_makemodel_id_when_not_generated(sample_candidate):
     )
     assert master["MakeModel"] == "8 gb ram"
     assert master["MakeModelId"] == 10338
+    assert master["Model"] is None
+    assert master["ModelId"] is None
     assert master["CategoryId"] == 1039
     assert master["SubCategoryId"] == 10067
+
+
+def test_master_returns_model_from_candidate(sample_candidate):
+    row = {**sample_candidate, "makemodel": "Asus", "makemodelid": 98655, "model": "test1", "modelid": 1151}
+    master = _master_from_candidate(
+        row,
+        make_model="Asus",
+        make_model_generated="N",
+    )
+    assert master["MakeModel"] == "Asus"
+    assert master["MakeModelId"] == 98655
+    assert master["Model"] == "test1"
+    assert master["ModelId"] == 1151
+
+
+def test_master_keeps_model_when_makemodel_generated(sample_candidate):
+    row = {**sample_candidate, "model": "test1", "modelid": "1151"}
+    master = _master_from_candidate(
+        row,
+        make_model="Asus test1",
+        make_model_generated="Y",
+    )
+    assert master["MakeModelId"] is None
+    assert master["Model"] == "test1"
+    assert master["ModelId"] == 1151
 
 
 def test_master_nulls_makemodel_id_when_generated(sample_candidate):
