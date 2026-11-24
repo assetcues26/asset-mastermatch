@@ -145,7 +145,12 @@ def _merge_candidates(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     order: list[str] = []
     for group in groups:
         for row in group:
-            key = str(row.get("_id") or row.get("makemodelid") or id(row))
+            key = str(
+                row.get("_id")
+                or row.get("modelid")
+                or row.get("makemodelid")
+                or id(row)
+            )
             current = merged.get(key)
             if current is None:
                 merged[key] = row
@@ -158,15 +163,24 @@ def _merge_candidates(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows[: max(PINECONE_TOP_K, 8)]
 
 
+def _row_match_text(row: dict[str, Any]) -> str:
+    """Make plus model, used only to rank candidates. Response fields stay separate."""
+    make_model = safe_str(row.get("makemodel")) or ""
+    model = safe_str(row.get("model")) or ""
+    if make_model and model and model.casefold() not in make_model.casefold():
+        return f"{make_model} {model}"
+    return make_model or model
+
+
 def _snap_to_existing(
     proposed: str, candidates: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
-    """Use the master whose MakeModel is already inside the rewritten text."""
+    """Use the master whose MakeModel or Model is already inside the rewritten text."""
     proposed_norm = normalize_text(proposed).casefold()
     best: dict[str, Any] | None = None
     best_len = 0
     for row in candidates:
-        make_model = safe_str(row.get("makemodel")) or ""
+        make_model = _row_match_text(row)
         norm = normalize_text(make_model).casefold()
         if len(norm) < _MIN_SNAP_LEN or norm not in proposed_norm:
             continue
@@ -284,6 +298,8 @@ def _master_from_candidate(
         "SubCategoryId": to_int_or_none(candidate.get("subcategoryid")),
         "MakeModel": make_model,
         "MakeModelId": make_model_id,
+        "Model": safe_str(candidate.get("model")),
+        "ModelId": to_int_or_none(candidate.get("modelid")),
     }
 
 
@@ -344,6 +360,8 @@ def _generated_without_master(
             "SubCategoryId": None,
             "MakeModel": proposed,
             "MakeModelId": None,
+            "Model": None,
+            "ModelId": None,
         },
         "MatchFound": "N",
         "MakeModelGenerated": "Y",
@@ -427,10 +445,10 @@ def _apply_llm_choice(
             pinecone_mm = proposed
             generated = False
 
-    # Prefer the candidate whose MakeModel actually shares the asset's model tokens.
-    best = max(candidates, key=lambda row: _fit(asset_name, row.get("makemodel")))
-    best_fit = _fit(asset_name, best.get("makemodel"))
-    chosen_fit = _fit(asset_name, chosen.get("makemodel"))
+    # Prefer the candidate whose MakeModel or Model shares the asset's tokens.
+    best = max(candidates, key=lambda row: _fit(asset_name, _row_match_text(row)))
+    best_fit = _fit(asset_name, _row_match_text(best))
+    chosen_fit = _fit(asset_name, _row_match_text(chosen))
     if best_fit[0] >= 2 and best_fit > chosen_fit:
         chosen = best
         proposed = safe_str(chosen.get("makemodel")) or ""
@@ -438,7 +456,7 @@ def _apply_llm_choice(
         generated = False
 
     # A related master already exists. Do not mint a new MakeModel from the asset text.
-    if generated and _shares_long_token(asset_name, pinecone_mm):
+    if generated and _shares_long_token(asset_name, _row_match_text(chosen) or pinecone_mm):
         proposed = pinecone_mm
         generated = False
 
@@ -578,6 +596,8 @@ def _candidate_debug_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "score": _score(row),
                 "makemodel": safe_str(row.get("makemodel")),
                 "makemodelid": to_int_or_none(row.get("makemodelid")),
+                "model": safe_str(row.get("model")),
+                "modelid": to_int_or_none(row.get("modelid")),
                 "assetclass": safe_str(row.get("assetclass")),
                 "category": safe_str(
                     row.get("category") or row.get("categoryname")
@@ -603,6 +623,8 @@ def _finish_with_debug(
             "Error": result.get("Error"),
             "MakeModel": None if master is None else master.get("MakeModel"),
             "MakeModelId": None if master is None else master.get("MakeModelId"),
+            "Model": None if master is None else master.get("Model"),
+            "ModelId": None if master is None else master.get("ModelId"),
         }
         maybe_log_match(debug)
     return result

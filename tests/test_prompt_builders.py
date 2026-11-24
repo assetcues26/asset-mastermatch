@@ -36,7 +36,16 @@ def test_format_candidates_includes_index(sample_candidate):
     summary = format_candidates_for_prompt([sample_candidate])
     assert "CandidateIndex=1" in summary
     assert "MakeModel=8 gb ram" in summary
+    assert "Model=" in summary
+    assert "ModelId=None" in summary
     assert "CategoryId=1039" in summary
+
+
+def test_format_candidates_includes_model(sample_candidate):
+    row = {**sample_candidate, "model": "test1", "modelid": 1151}
+    summary = format_candidates_for_prompt([row])
+    assert "Model=test1" in summary
+    assert "ModelId=1151" in summary
 
 
 def test_build_select_prompt(sample_candidate):
